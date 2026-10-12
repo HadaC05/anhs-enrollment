@@ -1,0 +1,47 @@
+#!/bin/sh
+set -eu
+
+cd /var/www/html
+
+# Render's filesystem is ephemeral. When PUBLIC_DISK_ROOT is set to a mounted
+# persistent disk (for example /var/data), keep uploads there instead.
+public_disk_root="${PUBLIC_DISK_ROOT:-/var/www/html/storage/app/public}"
+mkdir -p "$public_disk_root" storage/framework/cache storage/framework/sessions storage/framework/views storage/logs bootstrap/cache
+chown -R www-data:www-data storage bootstrap/cache "$public_disk_root"
+
+if [ ! -e public/storage ]; then
+    ln -s "$public_disk_root" public/storage
+fi
+
+php artisan package:discover --ansi
+
+# A unique token records a completed reset in PostgreSQL, so a Render restart
+# cannot repeat it while the environment flag remains enabled.
+if [ "${RUN_DATABASE_FRESH:-false}" = "true" ]; then
+    if [ "${RUN_DATABASE_SEEDER:-false}" = "true" ]; then
+        echo "Set RUN_DATABASE_SEEDER=false when using RUN_DATABASE_FRESH; the reset already seeds once." >&2
+        exit 1
+    fi
+
+    php artisan database:reset-once
+fi
+
+php artisan migrate --force
+
+# Disabled by default. Set RUN_DATABASE_SEEDER=true only for a deliberate,
+# one-time test-data setup, then set it back to false and redeploy.
+if [ "${RUN_DATABASE_FRESH:-false}" != "true" ] && [ "${RUN_DATABASE_SEEDER:-false}" = "true" ]; then
+    php artisan db:seed --force
+fi
+
+php artisan config:cache
+php artisan route:cache
+php artisan view:cache
+
+# Expand the web port before Supervisor starts Nginx and PHP.
+envsubst '${PORT}' < /etc/nginx/http.d/default.conf.template > /etc/nginx/http.d/default.conf
+
+# Keep the database worker in the same container for free Render web services.
+# It starts only after migrations and caches are ready.
+export RUN_QUEUE_WORKER="${RUN_QUEUE_WORKER:-true}"
+exec /usr/bin/supervisord -c /etc/supervisord.conf

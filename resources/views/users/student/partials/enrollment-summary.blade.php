@@ -1,0 +1,39 @@
+@php
+    $enrollment = $enrollment ?? null;
+    $isSeniorHigh = $enrollment?->isSeniorHigh() ?? false;
+    $studentName = optional($application)->last_name
+        ? trim(optional($application)->last_name.', '.optional($application)->first_name.(optional($application)->middle_name ? ' '.optional($application)->middle_name : '').(optional($application)->suffix ? ' '.optional($application)->suffix : ''))
+        : (Auth::user()->name ?? 'Student');
+
+    $infoRows = [
+        ['label' => 'LRN', 'value' => optional($student)->lrn ?? '—'],
+        ['label' => 'Student Name', 'value' => $studentName],
+        ['label' => 'School Year', 'value' => $enrollment?->academicYear?->school_year ?? $activeYear?->school_year ?? '—'],
+        ['label' => 'Grade Level', 'value' => $enrollment?->gradeLevel?->grade_label
+            ?? ($enrollment?->grade_level ? str_replace(['grade_', '_'], ['Grade ', ' '], $enrollment->grade_level) : '—')],
+        ['label' => 'Section', 'value' => $enrollment?->section?->name ?? 'Not Assigned'],
+    ];
+
+    if ($isSeniorHigh) {
+        $infoRows[] = ['label' => 'Semester', 'value' => $enrollment?->semester ? ucfirst($enrollment->semester).' Semester' : 'N/A'];
+        $infoRows[] = ['label' => 'Track', 'value' => $enrollment?->track?->name ?? $enrollment?->cluster?->track?->name ?? 'N/A'];
+        $infoRows[] = ['label' => 'Cluster', 'value' => $enrollment?->cluster?->name ?? 'N/A'];
+    }
+@endphp
+
+<div class="rounded-xl border border-gray-200 bg-white px-4 py-3 shadow-sm sm:px-5">
+    <div class="grid grid-cols-1 gap-x-6 gap-y-2 md:grid-cols-2">
+        @foreach ($infoRows as $index => $row)
+            @php
+                $isLastRow = $index >= count($infoRows) - (count($infoRows) % 2 === 0 ? 2 : 1);
+            @endphp
+            <div @class([
+                'flex items-start justify-between gap-4',
+                'border-b border-gray-100 pb-2' => ! $isLastRow,
+            ])>
+                <span class="text-xs text-gray-500 sm:text-sm">{{ $row['label'] }}</span>
+                <span class="text-right text-xs font-semibold text-[#296374] sm:text-sm">{{ $row['value'] }}</span>
+            </div>
+        @endforeach
+    </div>
+</div>

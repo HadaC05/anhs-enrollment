@@ -1,0 +1,61 @@
+services:
+  - type: web
+    name: anhs-sis
+    runtime: docker
+    plan: free
+    maxShutdownDelaySeconds: 300
+    healthCheckPath: /up
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: APP_DEBUG
+        value: "false"
+      - key: LOG_CHANNEL
+        value: stderr
+      - key: DB_CONNECTION
+        value: pgsql
+      # config/database.php reads DB_URL (not DATABASE_URL).
+      - key: DB_URL
+        fromDatabase:
+          name: anhs-sis-db
+          property: connectionString
+      - key: RUN_QUEUE_WORKER
+        value: "true"
+      - key: QUEUE_CONNECTION
+        value: database
+      - key: AUTO_START_LOCAL_IMPORT_WORKER
+        value: "false"
+      - key: CLASS_LIST_IMPORT_TIMEOUT
+        value: "240"
+      - key: DB_QUEUE_RETRY_AFTER
+        value: "300"
+      - key: CACHE_STORE
+        value: database
+      - key: SESSION_DRIVER
+        value: database
+      - key: APP_KEY
+        generateValue: true
+      # Keep disabled in production. Temporarily set to true only when you
+      # deliberately want to create the application's demo users and data.
+      - key: RUN_DATABASE_SEEDER
+        value: "false"
+      # A full reset is destructive. Set true with a unique DATABASE_RESET_TOKEN
+      # for one deployment, then set it back to false.
+      - key: RUN_DATABASE_FRESH
+        value: "false"
+      # Set this to the public Render URL after the first deployment.
+      - key: APP_URL
+        sync: false
+      - key: ASSET_URL
+        sync: false
+      # Optional: attach a paid persistent disk at /var/data and then enable these.
+      # - key: PUBLIC_DISK_ROOT
+      #   value: /var/data
+      # - key: FILESYSTEM_DISK
+      #   value: public
+
+databases:
+  - name: anhs-sis-db
+    plan: free
+    databaseName: anhs_sis
+    user: anhs_sis

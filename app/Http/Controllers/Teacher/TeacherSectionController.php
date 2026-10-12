@@ -1,0 +1,1984 @@
+<?php
+
+namespace App\Http\Controllers\Teacher;
+
+use App\Http\Controllers\Controller;
+use App\Http\Requests\Teacher\StoreTeacherSectionGradesRequest;
+use App\Models\AcademicYear;
+use App\Models\AdvisoryClassListImport;
+use App\Models\Cluster;
+use App\Models\Enrollment;
+use App\Models\EnrollmentMonthlyAttendance;
+use App\Models\EnrollmentStatus;
+use App\Models\GradeLevel;
+use App\Models\GradeStatus;
+use App\Models\GradingTerm;
+use App\Models\Section;
+use App\Models\SectionAttendanceSetting;
+use App\Models\SectionSf2Upload;
+use App\Models\Sf2Configuration;
+use App\Models\Sf9Configuration;
+use App\Models\Student;
+use App\Models\StudentGuardian;
+use App\Models\StudentObservedValue;
+use App\Models\StudentSf9Comment;
+use App\Models\StudentSubject;
+use App\Models\StudentSubjectGrade;
+use App\Models\TeacherSubjectAssignment;
+use App\Support\AssignmentGradeTermUnlocker;
+use App\Support\LearnerPermanentRecordBuilder;
+use App\Support\PromotionEligibility;
+use App\Support\PromotionRegistrar;
+use App\Support\RegistrarGradeDigest;
+use App\Support\Sf2AttendanceImporter;
+use App\Support\Sf9AttendanceSummary;
+use App\Support\Sf9ReportCardBuilder;
+use App\Support\StudentCredentials;
+use Illuminate\Http\RedirectResponse;
+use Illuminate\Http\Request;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Hash;
+use Illuminate\Support\Facades\Storage;
+use Illuminate\Support\Str;
+use Illuminate\Validation\ValidationException;
+use Illuminate\View\View;
+
+class TeacherSectionController extends Controller
+{
+    public function index(Request $request): View
+    {
+        $staff = $request->user();
+        $sections = collect();
+        $search = $request->string('search')->toString();
+        $gradeLevel = $request->string('grade_level')->toString();
+        $gradeId = GradeLevel::idForValue($gradeLevel);
+        $clusterId = $request->string('cluster_ID')->toString();
+        $schoolYearId = $request->has('SY_ID')
+            ? $request->string('SY_ID')->toString()
+            : (string) AcademicYear::query()->where('status', true)->value('SY_ID');
+        $perPage = (int) $request->input('per_page', 10);
+        if (! in_array($perPage, [10, 20, 50], true)) {
+            $perPage = 10;
+        }
+
+        if ($staff) {
+            $gradeStatusIds = GradeStatus::idsBySlug();
+            $currentTermIds = array_filter([
+                StudentSubjectGrade::termIdForPeriodKey(GradingTerm::currentEditablePeriodKey()),
+                StudentSubjectGrade::termIdForPeriodKey(GradingTerm::currentSeniorHighPeriodKey()),
+            ]);
+
+            $assignmentScope = function ($query) use ($staff, $gradeStatusIds, $currentTermIds): void {
+                $query->withoutMapehParents()->with(['subject'])
+                    ->where('teacher_subject_assignments.staff_ID', $staff->staff_id)
+                    ->join('sections', 'teacher_subject_assignments.section_ID', '=', 'sections.section_ID')
+                    ->join('curriculum_grade_levels', 'sections.curriculum_grade_level_ID', '=', 'curriculum_grade_levels.curriculum_ID')
+                    ->leftJoin('subjects', 'teacher_subject_assignments.subject_ID', '=', 'subjects.subject_ID')
+                    ->orderBy('curriculum_grade_levels.semester_ID')
+                    ->orderBy('subjects.title')
+                    ->select('teacher_subject_assignments.*')
+                    ->withCount(['grades' => fn ($gradeQuery) => $gradeQuery->whereIn('term_ID', $currentTermIds)]);
+
+                foreach (GradeStatus::slugs() as $status) {
+                    $statusId = $gradeStatusIds[$status] ?? null;
+
+                    if ($statusId) {
+                        $query->withCount([
+                            "grades as {$status}_grades_count" => fn ($gradeQuery) => $gradeQuery
+                                ->whereIn('term_ID', $currentTermIds)
+                                ->where('grade_status_ID', $statusId),
+                        ]);
+                    }
+                }
+            };
+
+            $sections = Section::query()
+                ->active()
+                ->with([
+                    'academicYear',
+                    'cluster',
+                    'gradeLevel',
+                    'teacherSubjectAssignments' => $assignmentScope,
+                ])
+                ->withCount(['enrollments as active_enrollments_count' => function ($subQuery) {
+                    $subQuery->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds());
+                }])
+                ->whereHas('teacherSubjectAssignments', function ($query) use ($staff, $search): void {
+                    $query->withoutMapehParents()->where('teacher_subject_assignments.staff_ID', $staff->staff_id)
+                        ->when($search !== '', function ($assignmentQuery) use ($search): void {
+                            $assignmentQuery->where(function ($inner) use ($search): void {
+                                $inner->whereHas('section', function ($sectionQuery) use ($search): void {
+                                    $sectionQuery->where('name', 'like', '%'.$search.'%');
+                                })->orWhereHas('subject', function ($subjectQuery) use ($search): void {
+                                    $subjectQuery->where('title', 'like', '%'.$search.'%')
+                                        ->orWhere('code', 'like', '%'.$search.'%');
+                                });
+                            });
+                        });
+                })
+                ->when($search !== '', function ($query) use ($search): void {
+                    $query->where(function ($inner) use ($search): void {
+                        $inner->where('name', 'like', '%'.$search.'%')
+                            ->orWhereHas('teacherSubjectAssignments.subject', function ($subjectQuery) use ($search): void {
+                                $subjectQuery->where('title', 'like', '%'.$search.'%')
+                                    ->orWhere('code', 'like', '%'.$search.'%');
+                            });
+                    });
+                })
+                ->when($gradeId, function ($query) use ($gradeId): void {
+                    $query->where('grade_ID', $gradeId);
+                })
+                ->when($clusterId !== '', function ($query) use ($clusterId): void {
+                    $query->where('cluster_ID', $clusterId);
+                })
+                ->when($schoolYearId !== '', function ($query) use ($schoolYearId): void {
+                    $query->where('SY_ID', $schoolYearId);
+                })
+                ->orderBy('grade_ID')
+                ->orderBy('name')
+                ->paginate($perPage)
+                ->withQueryString();
+        }
+
+        return view('users.teacher.sections.index', [
+            'sections' => $sections,
+            'clusters' => Cluster::query()->orderBy('name')->get(['cluster_ID', 'name']),
+            'academicYears' => AcademicYear::query()->orderByDesc('school_year')->get(['SY_ID', 'school_year']),
+            'gradeLevels' => GradeLevel::options(),
+            'seniorHighGradeIds' => array_filter([
+                GradeLevel::idForValue('grade_11'),
+                GradeLevel::idForValue('grade_12'),
+            ]),
+            'juniorHighTermLabel' => GradingTerm::currentEditablePeriodLabel() ?? 'Term',
+            'seniorHighTermLabel' => GradingTerm::currentSeniorHighPeriod()['term_label'] ?? 'Term',
+            'filters' => [
+                'search' => $search,
+                'grade_level' => $gradeLevel,
+                'cluster_ID' => $clusterId,
+                'SY_ID' => $schoolYearId,
+                'per_page' => $perPage,
+            ],
+        ]);
+    }
+
+    public function advisoryIndex(Request $request): View
+    {
+        $staffId = $request->user()?->staff_id;
+        $schoolYearId = $request->has('SY_ID')
+            ? $request->string('SY_ID')->toString()
+            : (string) AcademicYear::query()->where('status', true)->value('SY_ID');
+
+        $sections = Section::query()
+            ->active()
+            ->with(['academicYear', 'cluster', 'gradeLevel'])
+            ->withCount(['enrollments as active_enrollments_count' => function ($query): void {
+                $query->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds());
+            }])
+            ->where('staff_ID', $staffId)
+            ->when($schoolYearId !== '', function ($query) use ($schoolYearId): void {
+                $query->where('SY_ID', $schoolYearId);
+            })
+            ->orderByDesc('SY_ID')
+            ->orderBy('grade_ID')
+            ->orderBy('name')
+            ->get();
+
+        return view('users.teacher.advisory.index', [
+            'sections' => $sections,
+            'academicYears' => AcademicYear::query()->orderByDesc('school_year')->get(['SY_ID', 'school_year']),
+            'schoolYearId' => $schoolYearId,
+        ]);
+    }
+
+    public function advisoryShow(Request $request, Section $section): View
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        $section->load(['academicYear', 'cluster', 'gradeLevel']);
+        $periods = GradingTerm::openPeriodsForSection($section);
+        $search = trim($request->string('search')->toString());
+        $selectedAssignmentId = (int) $request->integer('assignment_id');
+
+        $enrollments = Enrollment::query()
+            ->with(['student.application', 'promotionStatus'])
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->orderBy('enrollment_status_ID')
+            ->get()
+            ->sortBy(fn (Enrollment $enrollment) => $this->studentSortKey($enrollment))
+            ->filter(function (Enrollment $enrollment) use ($search): bool {
+                if ($search === '') {
+                    return true;
+                }
+
+                $student = $enrollment->student;
+                $application = $student?->application;
+                $searchable = implode(' ', array_filter([
+                    $student?->lrn,
+                    $student?->first_name,
+                    $student?->middle_name,
+                    $student?->last_name,
+                    $application?->first_name,
+                    $application?->middle_name,
+                    $application?->last_name,
+                ]));
+
+                return str_contains(mb_strtolower($searchable), mb_strtolower($search));
+            })
+            ->values();
+
+        $assignments = TeacherSubjectAssignment::query()
+            ->with(['subject', 'staff'])
+            ->where('section_ID', $section->section_ID)
+            ->where('SY_ID', $section->SY_ID)
+            ->orderBy('subject_ID')
+            ->get();
+        $sourceAssignments = $assignments;
+        $assignments = \App\Support\MapehGrades::assignments($section, $assignments);
+        $availableAssignments = $assignments;
+
+        if ($selectedAssignmentId && (! $assignments->contains('assignment_ID', $selectedAssignmentId)
+            || $assignments->firstWhere('assignment_ID', $selectedAssignmentId)?->computed_mapeh)) {
+            $selectedAssignmentId = 0;
+        }
+        if ($selectedAssignmentId) {
+            $assignments = $assignments->where('assignment_ID', $selectedAssignmentId)->values();
+        }
+
+        $grades = StudentSubjectGrade::query()
+            ->with(['studentSubject', 'gradeReturnReason'])
+            ->whereHas('studentSubject', fn ($query) => $query->whereIn('enrollment_ID', $enrollments->pluck('enrollment_ID')))
+            ->whereIn('assignment_ID', $sourceAssignments->pluck('assignment_ID'))
+            ->get()
+            ->groupBy(fn (StudentSubjectGrade $grade) => $grade->studentSubject?->enrollment_ID)
+            ->map(fn ($studentGrades) => $studentGrades
+                ->groupBy('assignment_ID')
+                ->map(fn ($assignmentGrades) => $assignmentGrades->keyBy('grading_period')));
+
+        $rows = $enrollments->map(function (Enrollment $enrollment) use ($assignments, $availableAssignments, $grades, $periods): array {
+            $student = $enrollment->student;
+            $application = $student?->application;
+            $studentGrades = \App\Support\MapehGrades::grades($availableAssignments, $grades->get($enrollment->enrollment_ID, collect()), array_column($periods, 'key'));
+            $subjects = [];
+            $overallValues = [];
+
+            foreach ($assignments as $assignment) {
+                $periodGrades = $studentGrades->get($assignment->assignment_ID, collect());
+                $values = [];
+
+                foreach ($periods as $period) {
+                    $value = $periodGrades->get($period['key'])?->numeric_grade;
+                    if ($value !== null) {
+                        $values[] = (float) $value;
+                        if (! $assignment->mapeh_component) {
+                            $overallValues[] = (float) $value;
+                        }
+                    }
+                }
+
+                $subjects[$assignment->assignment_ID] = [
+                    'periods' => $periodGrades,
+                    'average' => count($values) ? round(array_sum($values) / count($values), 2) : null,
+                ];
+            }
+
+            return [
+                'enrollment' => $enrollment,
+                'student' => $student,
+                'name' => $application
+                    ? trim($application->last_name.', '.$application->first_name.' '.$application->middle_name)
+                    : ($student?->name ?? 'N/A'),
+                'lrn' => $student?->lrn ?? 'N/A',
+                'subjects' => $subjects,
+                'overall_average' => count($overallValues) ? round(array_sum($overallValues) / count($overallValues), 2) : null,
+            ];
+        });
+
+        return view('users.teacher.advisory.show', [
+            'section' => $section,
+            'periods' => $periods,
+            'assignments' => $assignments,
+            'availableAssignments' => $availableAssignments,
+            'rows' => $rows,
+            'selectedAssignmentId' => $selectedAssignmentId,
+        ]);
+    }
+
+    public function downloadAdvisorySf1(Request $request, Section $section): \Symfony\Component\HttpFoundation\BinaryFileResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        return \App\Support\Sf1Export::download($section);
+    }
+
+    public function advisoryClassList(Request $request, Section $section): View
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        $section->load(['academicYear', 'cluster', 'gradeLevel']);
+        $search = trim($request->string('search')->toString());
+        $sex = $request->string('sex')->toString();
+        if (! in_array($sex, ['', 'male', 'female', 'unspecified'], true)) {
+            $sex = '';
+        }
+
+        $enrollments = Enrollment::query()
+            ->with(['student.application'])
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->get()
+            ->filter(function (Enrollment $enrollment) use ($search, $sex): bool {
+                $student = $enrollment->student;
+                $application = $student?->application;
+                $studentSex = strtolower((string) $student?->sex);
+
+                if ($sex === 'unspecified') {
+                    if (in_array($studentSex, ['male', 'female'], true)) {
+                        return false;
+                    }
+                } elseif ($sex !== '' && $studentSex !== $sex) {
+                    return false;
+                }
+
+                if ($search === '') {
+                    return true;
+                }
+
+                $searchable = implode(' ', array_filter([
+                    $student?->lrn,
+                    $student?->first_name,
+                    $student?->middle_name,
+                    $student?->last_name,
+                    $application?->first_name,
+                    $application?->middle_name,
+                    $application?->last_name,
+                ]));
+
+                return str_contains(mb_strtolower($searchable), mb_strtolower($search));
+            })
+            ->sortBy(fn (Enrollment $enrollment) => $this->studentSortKey($enrollment))
+            ->values();
+
+        $latestImport = AdvisoryClassListImport::query()
+            ->select([
+                'id',
+                'section_ID',
+                'requested_by',
+                'original_filename',
+                'total_students',
+                'processed_students',
+                'created_at',
+                'status',
+                'result',
+                'failure_message',
+                'started_at',
+                'completed_at',
+            ])
+            ->where('section_ID', $section->section_ID)
+            ->where('requested_by', $request->user()->staff_id)
+            ->latest('id')
+            ->first();
+
+        $showImportResult = false;
+        if ($latestImport && in_array($latestImport->status, ['completed', 'failed'], true)) {
+            $notificationKey = 'class_list_import_seen.'.$request->user()->staff_id.'.'.$section->section_ID;
+            $notificationValue = $latestImport->id.'-'.$latestImport->status;
+            $showImportResult = $request->session()->get($notificationKey) !== $notificationValue;
+            $request->session()->put($notificationKey, $notificationValue);
+        }
+
+        return view('users.teacher.advisory.class-list', compact('section', 'enrollments', 'search', 'sex', 'latestImport', 'showImportResult'));
+    }
+
+    public function advisoryStudentProfile(Request $request, Section $section, Enrollment $enrollment): View
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        abort_unless($enrollment->section_ID === $section->section_ID, 404);
+
+        $section->load(['academicYear', 'cluster', 'gradeLevel']);
+        $enrollment->load([
+            'student.profile',
+            'student.guardians',
+            'student.addresses',
+        ]);
+
+        return view('users.teacher.advisory.student-profile', [
+            'section' => $section,
+            'student' => $enrollment->student,
+            'backUrl' => route('teacher.advisory.class-list.index', [
+                'section' => $section,
+                'search' => $request->string('search')->toString(),
+                'sex' => $request->string('sex')->toString(),
+            ]),
+        ]);
+    }
+
+    public function bulkPromote(Request $request, Section $section): RedirectResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        $validated = $request->validate([
+            'enrollment_ids' => ['required', 'array', 'min:1'],
+            'enrollment_ids.*' => ['integer'],
+        ]);
+        $enrollments = Enrollment::query()
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->whereIn('enrollment_ID', $validated['enrollment_ids'])
+            ->get();
+        $promoted = 0;
+        $completed = 0;
+        $blocked = [];
+
+        foreach ($enrollments as $enrollment) {
+            try {
+                $nextEnrollment = DB::transaction(function () use ($enrollment): ?Enrollment {
+                    return PromotionRegistrar::promote($enrollment);
+                });
+                $nextEnrollment ? $promoted++ : $completed++;
+            } catch (ValidationException $exception) {
+                $blocked[] = $exception->errors()['promotion'][0] ?? 'This learner could not be promoted.';
+            }
+        }
+
+        $message = match (true) {
+            $completed === 0 => "Bulk promotion completed for {$promoted} learner(s).",
+            $promoted === 0 => "Junior High School completion recorded for {$completed} Grade 10 learner(s); no Grade 11 enrollments were created.",
+            default => "Bulk processing completed: {$promoted} learner(s) promoted and {$completed} Grade 10 learner(s) marked as Junior High School completers.",
+        };
+        if ($blocked !== []) {
+            $message .= ' '.count($blocked).' learner(s) were skipped: '.$blocked[0];
+        }
+
+        $processed = $promoted + $completed;
+        $noticeType = $blocked === [] ? 'status' : ($processed > 0 ? 'warning' : 'error');
+
+        return back()->with($noticeType, $message);
+    }
+
+    public function promote(Request $request, Section $section, Enrollment $enrollment): RedirectResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        abort_unless(
+            (int) $enrollment->section_ID === (int) $section->section_ID
+            && in_array((int) $enrollment->enrollment_status_ID, EnrollmentStatus::activeIds(), true),
+            404,
+        );
+
+        $nextEnrollment = DB::transaction(fn (): ?Enrollment => PromotionRegistrar::promote($enrollment));
+
+        if (! $nextEnrollment) {
+            return back()->with('status', 'Learner marked as having completed Junior High School. No Grade 11 enrollment was created.');
+        }
+
+        $nextGradeLabel = $nextEnrollment->gradeLevel()->value('grade_label') ?? 'next-grade';
+
+        return back()->with('status', "Learner promoted. A pending {$nextGradeLabel} enrollment was created for {$nextEnrollment->academicYear?->school_year}.");
+    }
+
+    public function advisoryPromotions(Request $request, Section $section): View
+    {
+        $this->authorizeAdvisorySection($request, $section);
+        $section->load(['academicYear', 'cluster', 'gradeLevel']);
+
+        [$enrollments, $evaluations, $tab] = $this->filteredAdvisoryPromotions($request, $section);
+
+        $nextAcademicYear = AcademicYear::query()
+            ->whereDate('start_date', '>', $section->academicYear?->start_date)
+            ->orderBy('start_date')
+            ->first();
+        $alreadyPromotedStudentIds = $nextAcademicYear
+            ? Enrollment::query()
+                ->where('SY_ID', $nextAcademicYear->SY_ID)
+                ->whereIn('student_ID', $enrollments->pluck('student_ID'))
+                ->pluck('student_ID')
+                ->map(fn (mixed $studentId): int => (int) $studentId)
+                ->all()
+            : [];
+
+        return view('users.teacher.advisory.promotions', compact(
+            'section',
+            'enrollments',
+            'evaluations',
+            'nextAcademicYear',
+            'alreadyPromotedStudentIds',
+            'tab',
+        ));
+    }
+
+    private function filteredAdvisoryPromotions(Request $request, Section $section): array
+    {
+        $filters = $request->validate([
+            'search' => ['nullable', 'string', 'max:200'],
+            'eligibility' => ['nullable', \Illuminate\Validation\Rule::in(['all', ...array_column(\App\Models\PromotionStatus::definitions(), 'slug')])],
+            'tab' => ['nullable', \Illuminate\Validation\Rule::in(['promotions', 'remediation'])],
+        ]);
+        $tab = ($filters['tab'] ?? null) === 'remediation' ? 'remediation' : 'promotions';
+        $enrollments = Enrollment::query()
+            ->with(['student.application', 'promotionStatus', 'gradingSemester.status', 'remediationCase.subjects'])
+            ->where('section_ID', $section->section_ID)
+            ->where('SY_ID', $section->SY_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->get()
+            ->sortBy(fn (Enrollment $enrollment) => $this->studentSortKey($enrollment))
+            ->values();
+
+        $evaluations = PromotionEligibility::synchronizeMany($enrollments);
+
+        $enrollments = $enrollments->filter(function ($enrollment) use ($filters, $evaluations, $tab) {
+            if ($tab === 'remediation' && ! $enrollment->remediationCase) {
+                return false;
+            }
+            $status = $filters['eligibility'] ?? 'all';
+            if ($status !== 'all' && $evaluations[$enrollment->enrollment_ID]['status'] !== $status) {
+                return false;
+            }
+            $student = $enrollment->student;
+            $searchable = mb_strtolower(implode(' ', [
+                $student?->lrn, $student?->first_name, $student?->middle_name, $student?->last_name,
+                $student?->application?->first_name, $student?->application?->middle_name, $student?->application?->last_name,
+            ]));
+            foreach (preg_split('/[\s,]+/', trim($filters['search'] ?? ''), -1, PREG_SPLIT_NO_EMPTY) as $term) {
+                if (! str_contains($searchable, mb_strtolower($term))) {
+                    return false;
+                }
+            }
+
+            return true;
+        })->values();
+
+        return [$enrollments, $evaluations, $tab];
+    }
+
+    public function downloadSf5(Request $request, Section $section): \Symfony\Component\HttpFoundation\BinaryFileResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+        [$enrollments] = $this->filteredAdvisoryPromotions($request, $section);
+
+        return \App\Support\Sf5Export::download($enrollments);
+    }
+
+    public function advisoryAttendance(Request $request, Section $section): View
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        $section->load(['academicYear', 'cluster', 'gradeLevel']);
+        $months = $section->academicYear->attendanceMonths();
+        $attendanceView = $request->query('view') === 'detailed' ? 'detailed' : 'overview';
+        $selectedMonth = (int) $request->query('month', array_key_first($months));
+        if (! array_key_exists($selectedMonth, $months)) {
+            $selectedMonth = (int) array_key_first($months);
+        }
+        $schoolDays = array_intersect_key(Sf9AttendanceSummary::schoolDaysForSection($section), $months);
+
+        $enrollments = Enrollment::query()
+            ->with(['student'])
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->join('students', 'enrollments.student_ID', '=', 'students.id')
+            ->orderByRaw("CASE LOWER(COALESCE(students.sex, '')) WHEN 'male' THEN 0 WHEN 'female' THEN 1 ELSE 2 END")
+            ->orderBy('students.last_name')
+            ->orderBy('students.first_name')
+            ->select('enrollments.*')
+            ->get();
+
+        $attendanceRecords = EnrollmentMonthlyAttendance::query()
+            ->with('sourceUpload')
+            ->whereIn('enrollment_ID', $enrollments->pluck('enrollment_ID'))
+            ->get()
+            ->groupBy('enrollment_ID')
+            ->map(fn ($records) => $records->keyBy('month'));
+
+        $rows = $enrollments->map(function (Enrollment $enrollment) use ($attendanceRecords, $months, $schoolDays): array {
+            $student = $enrollment->student;
+            $records = $attendanceRecords->get($enrollment->enrollment_ID, collect());
+            $summary = Sf9AttendanceSummary::forEnrollment($enrollment->enrollment_ID, $schoolDays, array_keys($schoolDays));
+
+            return [
+                'enrollment' => $enrollment,
+                'name' => $student ? trim($student->last_name.', '.$student->first_name.' '.$student->middle_name) : 'N/A',
+                'lrn' => $student?->lrn ?? 'N/A',
+                'records' => $records,
+                'summary' => $summary,
+                'has_complete_attendance' => collect(array_keys($months))
+                    ->every(fn (int $month): bool => $records->has($month)),
+            ];
+        });
+
+        $sf2Uploads = SectionSf2Upload::query()
+            ->where('section_ID', $section->section_ID)
+            ->where('SY_ID', $section->SY_ID)
+            ->where('report_month', $selectedMonth)
+            ->latest()
+            ->orderByDesc('id')
+            ->get();
+
+        $selectedUpload = $sf2Uploads->firstWhere('id', (int) $request->query('upload')) ?? $sf2Uploads->first();
+
+        return view('users.teacher.advisory.attendance', [
+            'section' => $section,
+            'months' => $months,
+            'schoolDays' => $schoolDays,
+            'rows' => $rows,
+            'sf2Uploads' => $sf2Uploads,
+            'sf2Configuration' => Sf2Configuration::current(),
+            'attendanceView' => $attendanceView,
+            'selectedMonth' => $selectedMonth,
+            'selectedUpload' => $selectedUpload,
+        ]);
+    }
+
+    public function viewAdvisorySf2(Request $request, Section $section, SectionSf2Upload $upload): \Symfony\Component\HttpFoundation\BinaryFileResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+        abort_unless((int) $upload->section_ID === (int) $section->section_ID && (int) $upload->SY_ID === (int) $section->SY_ID, 404);
+        abort_unless(Storage::disk('local')->exists($upload->storage_path), 404);
+
+        return response()->file(Storage::disk('local')->path($upload->storage_path), [
+            'Content-Type' => match (strtolower(pathinfo($upload->storage_path, PATHINFO_EXTENSION))) {
+                'xls' => 'application/vnd.ms-excel',
+                'xlsx' => 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                default => 'application/pdf',
+            },
+            'Cache-Control' => 'private, no-store',
+            'X-Content-Type-Options' => 'nosniff',
+        ]);
+    }
+
+    public function storeAdvisoryAttendance(Request $request, Section $section): RedirectResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        $validated = $request->validate([
+            'school_days' => ['nullable', 'array'],
+            'school_days.*' => ['nullable', 'integer', 'min:0', 'max:31'],
+            'attendance' => ['nullable', 'array'],
+            'attendance.*' => ['nullable', 'array'],
+            'attendance.*.*' => ['nullable', 'array'],
+            'attendance.*.*.present' => ['nullable', 'integer', 'min:0', 'max:31'],
+            'attendance.*.*.absent' => ['nullable', 'integer', 'min:0', 'max:31'],
+        ]);
+
+        $allowedEnrollmentIds = Enrollment::query()
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->pluck('enrollment_ID')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+        $allowedEnrollmentIds = array_flip($allowedEnrollmentIds);
+        $monthKeys = $section->academicYear->attendanceMonths();
+
+        DB::transaction(function () use ($validated, $section, $allowedEnrollmentIds, $monthKeys): void {
+            foreach (($validated['school_days'] ?? []) as $month => $schoolDays) {
+                if (! isset($monthKeys[(int) $month])) {
+                    continue;
+                }
+
+                SectionAttendanceSetting::query()->updateOrCreate(
+                    [
+                        'section_ID' => $section->section_ID,
+                        'SY_ID' => $section->SY_ID,
+                        'month' => (int) $month,
+                    ],
+                    ['school_days' => (int) ($schoolDays ?? 0), 'source_sf2_upload_id' => null]
+                );
+            }
+
+            foreach (($validated['attendance'] ?? []) as $enrollmentId => $months) {
+                if (! isset($allowedEnrollmentIds[(int) $enrollmentId]) || ! is_array($months)) {
+                    continue;
+                }
+
+                foreach ($months as $month => $values) {
+                    if (! isset($monthKeys[(int) $month]) || ! is_array($values)) {
+                        continue;
+                    }
+
+                    $present = (int) ($values['present'] ?? 0);
+                    $absent = (int) ($values['absent'] ?? 0);
+
+                    if ($present === 0 && $absent === 0) {
+                        EnrollmentMonthlyAttendance::query()
+                            ->where('enrollment_ID', (int) $enrollmentId)
+                            ->where('month', (int) $month)
+                            ->delete();
+
+                        continue;
+                    }
+
+                    EnrollmentMonthlyAttendance::query()->updateOrCreate(
+                        [
+                            'enrollment_ID' => (int) $enrollmentId,
+                            'month' => (int) $month,
+                        ],
+                        [
+                            'days_present' => $present,
+                            'days_absent' => $absent,
+                            'source_sf2_upload_id' => null,
+                        ]
+                    );
+                }
+            }
+        });
+
+        return back()->with('status', 'Attendance records saved successfully.');
+    }
+
+    public function uploadAdvisorySf2(Request $request, Section $section): RedirectResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        $validated = $request->validate([
+            'report_month' => ['required', 'integer', 'in:'.implode(',', array_keys($section->academicYear->attendanceMonths()))],
+            'sf2_file' => ['required', 'file', 'mimes:pdf,xls,xlsx', 'max:10240'],
+        ], ['sf2_file.mimes' => 'Upload an SF2 PDF or Excel file (.xls or .xlsx).']);
+
+        $file = $validated['sf2_file'];
+        $path = $file->storeAs(
+            'sf2-uploads/'.$section->section_ID,
+            Str::uuid().'.'.$file->extension(),
+            'local'
+        );
+
+        $upload = SectionSf2Upload::query()->create([
+            'section_ID' => $section->section_ID,
+            'SY_ID' => $section->SY_ID,
+            'report_month' => (int) $validated['report_month'],
+            'original_filename' => $file->getClientOriginalName(),
+            'storage_path' => $path,
+            'status' => 'processing',
+            'uploaded_by' => $request->user()?->staff_id,
+        ]);
+
+        app(Sf2AttendanceImporter::class)->import($upload);
+        $upload->refresh();
+
+        $message = match ($upload->status) {
+            'failed' => $upload->parse_notes ?: 'Attendance could not be imported. Please check the SF2 file and try again.',
+            'partial' => 'SF2 attendance uploaded with unmatched learners. Review the monthly record.',
+            default => 'SF2 attendance uploaded successfully.',
+        };
+
+        $redirect = redirect()->route('teacher.advisory.attendance', [
+            'section' => $section,
+            'view' => 'detailed',
+            'month' => (int) $validated['report_month'],
+            'upload' => $upload->id,
+        ]);
+
+        if ($upload->status === 'failed') {
+            return $redirect->with([
+                'attendance_import_error' => $message,
+                'error' => $message,
+            ]);
+        }
+
+        return $redirect->with('status', $message);
+    }
+
+    public function advisorySf9(Request $request, Section $section): View
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        $section->load(['academicYear', 'cluster', 'gradeLevel', 'adviser', 'curriculum']);
+        $selectedEnrollmentIds = collect((array) $request->input('enrollment_ids', []))
+            ->push($request->input('enrollment_ID'))
+            ->filter()
+            ->map(fn ($id): int => (int) $id)
+            ->filter()
+            ->unique()
+            ->values();
+
+        $enrollments = Enrollment::query()
+            ->with(['student', 'cluster', 'track', 'electives', 'studentSubjects', 'academicYear'])
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->when($selectedEnrollmentIds->isNotEmpty(), function ($query) use ($selectedEnrollmentIds): void {
+                $query->whereIn('enrollment_ID', $selectedEnrollmentIds);
+            })
+            ->get()
+            ->sortBy(fn (Enrollment $enrollment) => $this->studentSortKey($enrollment))
+            ->values();
+
+        if ($enrollments->isEmpty()) {
+            abort(404);
+        }
+
+        $assignments = TeacherSubjectAssignment::query()
+            ->with(['subject.subjectType'])
+            ->where('section_ID', $section->section_ID)
+            ->where('SY_ID', $section->SY_ID)
+            ->get();
+        $periods = $this->periodsForSection($section);
+        $schoolDaysByMonth = Sf9AttendanceSummary::schoolDaysForSection($section);
+
+        $grades = StudentSubjectGrade::query()
+            ->with('studentSubject')
+            ->whereHas('studentSubject', fn ($query) => $query->whereIn('enrollment_ID', $enrollments->pluck('enrollment_ID')))
+            ->whereIn('assignment_ID', $assignments->pluck('assignment_ID'))
+            ->get()
+            ->groupBy(fn (StudentSubjectGrade $grade) => $grade->studentSubject?->enrollment_ID)
+            ->map(fn ($studentGrades) => $studentGrades
+                ->groupBy('assignment_ID')
+                ->map(fn ($assignmentGrades) => $assignmentGrades->keyBy('grading_period')));
+
+        $observedValues = StudentObservedValue::query()
+            ->whereIn('enrollment_ID', $enrollments->pluck('enrollment_ID'))
+            ->get()
+            ->groupBy('enrollment_ID')
+            ->map(fn ($studentValues) => $studentValues
+                ->groupBy('statement_key')
+                ->map(fn ($statementValues) => $statementValues->keyBy('grading_period')));
+
+        $enrollments->loadMissing('sf9Comments');
+        $principalName = Sf9ReportCardBuilder::principalName();
+        $cards = $enrollments->map(fn (Enrollment $enrollment): array => Sf9ReportCardBuilder::buildCard(
+            $enrollment,
+            $section,
+            $assignments,
+            $grades->get($enrollment->enrollment_ID, collect()),
+            $observedValues->get($enrollment->enrollment_ID, collect()),
+            $periods,
+            $schoolDaysByMonth,
+            $principalName,
+        ));
+
+        return view('users.teacher.advisory.sf9-print', [
+            'section' => $section,
+            'periods' => $periods,
+            'cards' => $cards,
+            'observedValueStatements' => Sf9ReportCardBuilder::observedValueStatements(),
+            'observedValueMarkings' => Sf9ReportCardBuilder::observedValueMarkings(),
+        ]);
+    }
+
+    public function advisorySf10(Request $request, Section $section): View
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        $section->load(['academicYear', 'cluster', 'gradeLevel', 'adviser']);
+        $selectedEnrollmentIds = collect((array) $request->input('enrollment_ids', []))
+            ->push($request->input('enrollment_ID'))
+            ->filter()
+            ->map(fn ($id): int => (int) $id)
+            ->filter()
+            ->unique()
+            ->values();
+
+        $enrollments = Enrollment::query()
+            ->with(['student'])
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->when($selectedEnrollmentIds->isNotEmpty(), function ($query) use ($selectedEnrollmentIds): void {
+                $query->whereIn('enrollment_ID', $selectedEnrollmentIds);
+            })
+            ->get()
+            ->sortBy(fn (Enrollment $enrollment) => $this->studentSortKey($enrollment))
+            ->values();
+
+        if ($enrollments->isEmpty()) {
+            abort(404);
+        }
+
+        return view('users.teacher.advisory.sf10-print', [
+            'section' => $section,
+            'periods' => GradingTerm::periodsForSection($section),
+            'cards' => LearnerPermanentRecordBuilder::buildCardsForStudents($enrollments),
+        ]);
+    }
+
+    public function advisoryObservedValues(Request $request, Section $section): View
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        $section->load(['academicYear', 'cluster', 'gradeLevel']);
+        if (Sf9Configuration::usesTeacherComments($section)) {
+            return view('users.teacher.advisory.comments', [
+                'section' => $section,
+                'enrollments' => Enrollment::query()->with(['student', 'sf9Comments'])
+                    ->where('section_ID', $section->section_ID)
+                    ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+                    ->join('students', 'enrollments.student_ID', '=', 'students.id')
+                    ->orderBy('students.last_name')->orderBy('students.first_name')
+                    ->select('enrollments.*')->get(),
+                'periods' => GradingTerm::periodsForSection($section),
+                'editablePeriodKey' => $this->isGradingInputOpen($section) ? GradingTerm::currentEditablePeriodKeyForSection($section) : null,
+            ]);
+        }
+        $statements = Sf9ReportCardBuilder::observedValueStatements();
+        $coreValues = array_values(array_unique(array_column($statements, 'core_value')));
+        $activeCoreValue = $request->string('core')->toString();
+        if (! in_array($activeCoreValue, $coreValues, true)) {
+            $activeCoreValue = $coreValues[0] ?? '';
+        }
+
+        $enrollments = Enrollment::query()
+            ->with(['student'])
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->join('students', 'enrollments.student_ID', '=', 'students.id')
+            ->orderByRaw("CASE LOWER(COALESCE(students.sex, '')) WHEN 'male' THEN 0 WHEN 'female' THEN 1 ELSE 2 END")
+            ->orderBy('students.last_name')
+            ->orderBy('students.first_name')
+            ->orderBy('students.lrn')
+            ->select('enrollments.*')
+            ->get();
+
+        $observedValues = StudentObservedValue::query()
+            ->whereIn('enrollment_ID', $enrollments->pluck('enrollment_ID'))
+            ->get()
+            ->groupBy('enrollment_ID')
+            ->map(fn ($studentValues) => $studentValues
+                ->groupBy('statement_key')
+                ->map(fn ($statementValues) => $statementValues->keyBy('grading_period')));
+
+        $isGradingInputOpen = $this->isGradingInputOpen($section);
+        $periods = $this->gradingInputPeriods($section);
+        $lockedPeriodKeys = GradingTerm::lockedPeriodKeysForSection($section);
+        $editablePeriodKey = GradingTerm::currentEditablePeriodKeyForSection($section);
+        $editablePeriodLabel = GradingTerm::currentEditablePeriodLabelForSection($section);
+
+        return view('users.teacher.advisory.observed-values', [
+            'section' => $section,
+            'enrollments' => $enrollments,
+            'observedValues' => $observedValues,
+            'statements' => $statements,
+            'activeCoreValue' => $activeCoreValue,
+            'periods' => $periods,
+            'markings' => Sf9ReportCardBuilder::observedValueMarkings(),
+            'isObservedLocked' => ! $isGradingInputOpen,
+            'gradingInputClosed' => ! $isGradingInputOpen,
+            'lockedPeriodKeys' => $lockedPeriodKeys,
+            'editablePeriodKey' => $editablePeriodKey,
+            'editablePeriodLabel' => $editablePeriodLabel,
+        ]);
+    }
+
+    public function storeAdvisoryComments(Request $request, Section $section): RedirectResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+        abort_unless(Sf9Configuration::usesTeacherComments($section), 403);
+        $data = $request->validate([
+            'grading_period' => ['required', 'string'],
+            'comments' => ['required', 'array'],
+            'comments.*' => ['nullable', 'string', 'max:240'],
+        ]);
+        if (! $this->isGradingInputOpen($section) || $data['grading_period'] !== GradingTerm::currentEditablePeriodKeyForSection($section)) {
+            return back()->withInput()->withErrors(['grading_period' => 'Only the current open grading term can be edited.']);
+        }
+        $allowed = Enrollment::query()->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())->pluck('enrollment_ID')->map(fn ($id) => (string) $id)->all();
+        foreach (array_keys($data['comments']) as $id) {
+            abort_unless(in_array((string) $id, $allowed, true), 403);
+        }
+        try {
+            DB::transaction(function () use ($data, $request): void {
+                foreach ($data['comments'] as $id => $comment) {
+                    $comment = trim(preg_replace('/\s+/u', ' ', $comment ?? ''));
+                    if ($comment === '') {
+                        StudentSf9Comment::query()->where('enrollment_ID', $id)->where('grading_period', $data['grading_period'])->delete();
+                    } else {
+                        StudentSf9Comment::query()->updateOrCreate(
+                            ['enrollment_ID' => $id, 'grading_period' => $data['grading_period']],
+                            ['comment' => $comment, 'posted_by' => $request->user()->staff_id],
+                        );
+                    }
+                }
+            });
+        } catch (\Throwable $exception) {
+            report($exception);
+
+            return back()->withInput()->with('error', 'Teacher remarks could not be saved. Please try again.');
+        }
+
+        return redirect()->route('teacher.advisory.observed-values', $section)->with('status', 'Teacher remarks saved successfully.');
+    }
+
+    public function storeAdvisoryObservedValues(Request $request, Section $section): RedirectResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+        abort_if(Sf9Configuration::usesTeacherComments($section), 403, 'Observed values are disabled for the selected SF9 format.');
+
+        $validated = $request->validate([
+            'markings' => ['nullable', 'array'],
+        ]);
+
+        $allowedEnrollmentIds = Enrollment::query()
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->pluck('enrollment_ID')
+            ->map(fn ($id) => (int) $id)
+            ->all();
+        $allowedEnrollmentIds = array_flip($allowedEnrollmentIds);
+        $statementKeys = array_flip(array_column(Sf9ReportCardBuilder::observedValueStatements(), 'key'));
+        $periods = $this->gradingInputPeriods($section);
+        $periodKeys = array_flip(array_column($periods, 'key'));
+        $lockedPeriodKeys = array_flip(GradingTerm::lockedPeriodKeysForSection($section));
+        $editablePeriodKey = GradingTerm::currentEditablePeriodKeyForSection($section);
+        $markingKeys = array_flip(array_keys(Sf9ReportCardBuilder::observedValueMarkings()));
+        $staffId = $request->user()->staff_id;
+
+        if (! $this->isGradingInputOpen($section)) {
+            return back()->withErrors(['markings' => 'This grading term is closed for teacher input.']);
+        }
+
+        if ($editablePeriodKey === null) {
+            return back()->withErrors(['markings' => 'No grading term is currently open for input.']);
+        }
+
+        DB::transaction(function () use ($validated, $allowedEnrollmentIds, $statementKeys, $periodKeys, $lockedPeriodKeys, $editablePeriodKey, $markingKeys, $staffId): void {
+            foreach (($validated['markings'] ?? []) as $enrollmentId => $statements) {
+                if (! isset($allowedEnrollmentIds[(int) $enrollmentId]) || ! is_array($statements)) {
+                    continue;
+                }
+
+                foreach ($statements as $statementKey => $periods) {
+                    if (! isset($statementKeys[$statementKey]) || ! is_array($periods)) {
+                        continue;
+                    }
+
+                    foreach ($periods as $periodKey => $marking) {
+                        if (isset($lockedPeriodKeys[$periodKey]) || $periodKey !== $editablePeriodKey) {
+                            continue;
+                        }
+
+                        if (! is_string($marking) || ! isset($periodKeys[$periodKey])) {
+                            continue;
+                        }
+
+                        if ($marking === '') {
+                            StudentObservedValue::query()
+                                ->where('enrollment_ID', (int) $enrollmentId)
+                                ->where('statement_key', $statementKey)
+                                ->where('grading_period', $periodKey)
+                                ->delete();
+
+                            continue;
+                        }
+
+                        if (! isset($markingKeys[$marking])) {
+                            continue;
+                        }
+
+                        StudentObservedValue::query()->updateOrCreate(
+                            [
+                                'enrollment_ID' => (int) $enrollmentId,
+                                'statement_key' => $statementKey,
+                                'grading_period' => $periodKey,
+                            ],
+                            [
+                                'marking' => $marking,
+                                'status' => 'recorded',
+                                'submitted_at' => null,
+                                'reviewed_by' => null,
+                                'reviewed_at' => null,
+                                'posted_by' => $staffId,
+                            ]
+                        );
+                    }
+                }
+            }
+        });
+
+        $parameters = ['section' => $section];
+        $activeCoreValue = $request->string('active_core')->toString();
+        if (in_array($activeCoreValue, array_column(Sf9ReportCardBuilder::observedValueStatements(), 'core_value'), true)) {
+            $parameters['core'] = $activeCoreValue;
+        }
+
+        return redirect()->route('teacher.advisory.observed-values', $parameters)
+            ->with('status', 'Observed values saved successfully.');
+    }
+
+    public function bulkStoreAdvisoryObservedValues(Request $request, Section $section): RedirectResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+        abort_if(Sf9Configuration::usesTeacherComments($section), 403, 'Observed values are disabled for the selected SF9 format.');
+
+        $validated = $request->validate([
+            'enrollment_ids' => ['required', 'array', 'min:1'],
+            'enrollment_ids.*' => ['required', 'integer'],
+            'statement_key' => ['required', 'string'],
+            'grading_period' => ['required', 'string'],
+            'marking' => ['required', 'string'],
+        ]);
+
+        $statementKeys = array_flip(array_column(Sf9ReportCardBuilder::observedValueStatements(), 'key'));
+        $periodKeys = array_flip(array_column($this->gradingInputPeriods($section), 'key'));
+        $editablePeriodKey = GradingTerm::currentEditablePeriodKeyForSection($section);
+        $markingKeys = array_flip(array_keys(Sf9ReportCardBuilder::observedValueMarkings()));
+
+        if (! isset($statementKeys[$validated['statement_key']], $periodKeys[$validated['grading_period']], $markingKeys[$validated['marking']])) {
+            return back()->withErrors(['marking' => 'Please select a valid statement, term, and marking.']);
+        }
+
+        if ($validated['grading_period'] !== $editablePeriodKey) {
+            return back()->withErrors(['marking' => 'Only the current school grading term can be edited.']);
+        }
+
+        if (! $this->isGradingInputOpen($section)) {
+            return back()->withErrors(['marking' => 'This grading term is closed for teacher input.']);
+        }
+
+        $enrollmentIds = Enrollment::query()
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->whereIn('enrollment_ID', $validated['enrollment_ids'])
+            ->pluck('enrollment_ID');
+
+        $staffId = $request->user()->staff_id;
+
+        DB::transaction(function () use ($enrollmentIds, $validated, $staffId): void {
+            foreach ($enrollmentIds as $enrollmentId) {
+                StudentObservedValue::query()->updateOrCreate(
+                    [
+                        'enrollment_ID' => $enrollmentId,
+                        'statement_key' => $validated['statement_key'],
+                        'grading_period' => $validated['grading_period'],
+                    ],
+                    [
+                        'marking' => $validated['marking'],
+                        'status' => 'recorded',
+                        'submitted_at' => null,
+                        'reviewed_by' => null,
+                        'reviewed_at' => null,
+                        'posted_by' => $staffId,
+                    ]
+                );
+            }
+        });
+
+        return back()->with('status', 'Observed values saved successfully.');
+    }
+
+    public function show(Request $request, TeacherSubjectAssignment $assignment): View|RedirectResponse
+    {
+        $this->authorizeAssignment($request, $assignment);
+        if (\App\Support\MapehGrades::isComputed($assignment)) {
+            return redirect()->route('teacher.sections.index')->with('status', 'This combined grade is handled through its component subjects.');
+        }
+
+        $assignment->load(['section.academicYear', 'section.cluster', 'section.gradeLevel', 'section.curriculum.gradingSemester', 'subject']);
+        $section = $assignment->section;
+        $semester = $section->curriculum?->gradingSemester?->key;
+        // A section's roster spans both Senior High semesters. The active
+        // semester chooses the subject and grading period, not its students.
+        $enrollments = Enrollment::query()
+            ->with(['student'])
+            ->where('section_ID', $section->section_ID)
+            ->whereHas('studentSubjects', fn ($query) => $query->where('subject_ID', $assignment->subject_ID))
+            ->orderBy('enrollment_status_ID')
+            ->get()
+            ->sortBy(fn (Enrollment $enrollment) => $this->studentSortKey($enrollment))
+            ->values();
+
+        $periods = GradingTerm::periodsForSection($section, $semester);
+        $inputPeriods = $this->assignmentGradingInputPeriods($assignment);
+        $periodKeys = array_column($inputPeriods, 'key');
+        $editablePeriodKeys = $periodKeys;
+        $lockedPeriodKeys = array_values(array_diff(array_column($periods, 'key'), $editablePeriodKeys));
+        $editablePeriodKey = GradingTerm::currentEditablePeriodKeyForSection($section, $semester);
+        $editablePeriodLabel = implode(', ', array_column($inputPeriods, 'label'));
+        $grades = StudentSubjectGrade::query()
+            ->with('studentSubject')
+            ->where('assignment_ID', $assignment->assignment_ID)
+            ->whereHas('studentSubject', fn ($query) => $query->whereIn('enrollment_ID', $enrollments->pluck('enrollment_ID')))
+            ->get()
+            ->groupBy(fn (StudentSubjectGrade $grade) => $grade->studentSubject?->enrollment_ID)
+            ->map(fn ($items) => $items->keyBy('grading_period'));
+
+        $canEditCurrentTerm = collect($editablePeriodKeys)->contains(function (string $periodKey) use ($grades): bool {
+            $periodGrades = $grades->flatten(1)->where('grading_period', $periodKey);
+
+            return $periodGrades->isEmpty() || $periodGrades->contains(fn (StudentSubjectGrade $grade): bool => ! $grade->isTeacherLocked());
+        });
+
+        $summaries = $this->buildSummaries($enrollments, $grades, $periods);
+        $gradeReturnReasons = $grades->flatten(1)
+            ->filter(fn (StudentSubjectGrade $grade): bool => $grade->status === GradeStatus::REJECTED)
+            ->pluck('gradeReturnReason')
+            ->filter()
+            ->unique('reason_ID')
+            ->values();
+
+        return view('users.teacher.sections.show', [
+            'assignment' => $assignment,
+            'section' => $section,
+            'enrollments' => $enrollments,
+            'periods' => $periods,
+            'inputPeriods' => $inputPeriods,
+            'grades' => $grades,
+            'summaries' => $summaries,
+            'lockedPeriodKeys' => $lockedPeriodKeys,
+            'editablePeriodKey' => $editablePeriodKey,
+            'editablePeriodLabel' => $editablePeriodLabel,
+            'canEditCurrentTerm' => $canEditCurrentTerm,
+            'gradeReturnReasons' => $gradeReturnReasons,
+        ]);
+    }
+
+    public function importGrades(Request $request, TeacherSubjectAssignment $assignment): \Illuminate\Http\JsonResponse
+    {
+        $this->authorizeAssignment($request, $assignment);
+        $data = $request->validate([
+            'class_record' => ['required', 'file', 'mimes:xlsx', 'extensions:xlsx', 'max:10240'],
+            'period' => ['required', 'string'],
+        ]);
+        $assignment->load('section.gradeLevel', 'section.curriculum.gradingSemester');
+        $periods = $this->assignmentGradingInputPeriods($assignment);
+        if (! in_array($data['period'], array_column($periods, 'key'), true)) {
+            throw \Illuminate\Validation\ValidationException::withMessages(['period' => 'This term is not open for grade input. Refresh the grade sheet and select an editable term.']);
+        }
+        if (! preg_match('/term_(\d+)$/', $data['period'], $match)) {
+            throw \Illuminate\Validation\ValidationException::withMessages(['period' => 'This grading period cannot be mapped to a TERM worksheet.']);
+        }
+        $mapehComponent = \App\Models\MapehConfiguration::forSection($assignment->section)?->components
+            ->first(fn ($component) => (int) $component->curriculumSubject->subject_ID === (int) $assignment->subject_ID);
+        $componentSheet = match ($mapehComponent?->key) {
+            'music_arts' => 'M and A',
+            'pe_health' => 'PE and H',
+            default => null,
+        };
+        try {
+            $records = \App\Support\EClassRecord::read($request->file('class_record')->getRealPath(), (int) $match[1], $componentSheet);
+        } catch (\RuntimeException $exception) {
+            throw \Illuminate\Validation\ValidationException::withMessages(['class_record' => $exception->getMessage()]);
+        }
+        $enrollments = Enrollment::query()->with('student')
+            ->where('section_ID', $assignment->section_ID)
+            ->where('SY_ID', $assignment->SY_ID)->get();
+
+        return response()->json(\App\Support\EClassRecordGrades::match($records, $enrollments, $assignment, $data['period']));
+    }
+
+    public function storeGrades(StoreTeacherSectionGradesRequest $request, TeacherSubjectAssignment $assignment): RedirectResponse
+    {
+        $this->authorizeAssignment($request, $assignment);
+
+        $assignment->load('section.gradeLevel', 'section.curriculum.gradingSemester');
+        $section = $assignment->section;
+        $semester = $assignment->section?->curriculum?->gradingSemester?->key;
+        $periods = $this->assignmentGradingInputPeriods($assignment);
+        $periodKeys = array_column($periods, 'key');
+        $editablePeriodKeys = array_flip($periodKeys);
+
+        $enrollmentIds = Enrollment::query()
+            ->where('section_ID', $section->section_ID)
+            ->whereHas('studentSubjects', fn ($query) => $query->where('subject_ID', $assignment->subject_ID))
+            ->pluck('enrollment_ID')
+            ->toArray();
+
+        if ($editablePeriodKeys === []) {
+            return back()->withErrors(['grades' => 'No grading term is currently open for input.']);
+        }
+
+        $gradesInput = $request->input('grades', []);
+
+        foreach ($gradesInput as $enrollmentId => $periodData) {
+            if (! in_array((int) $enrollmentId, $enrollmentIds, true)) {
+                continue;
+            }
+
+            foreach ($periodKeys as $periodKey) {
+                if (! isset($editablePeriodKeys[$periodKey])) {
+                    continue;
+                }
+
+                $gradeValue = $periodData[$periodKey]['grade'] ?? null;
+                $remarksValue = $periodData[$periodKey]['remarks'] ?? null;
+
+                if ($gradeValue === null && $remarksValue === null) {
+                    continue;
+                }
+
+                $studentSubject = StudentSubject::query()
+                    ->where('enrollment_ID', $enrollmentId)
+                    ->where('subject_ID', $assignment->subject_ID)
+                    ->first();
+
+                if (! $studentSubject) {
+                    continue;
+                }
+
+                $existingGrade = StudentSubjectGrade::query()
+                    ->where('student_subject_ID', $studentSubject->student_subject_ID)
+                    ->where('assignment_ID', $assignment->assignment_ID)
+                    ->forPeriodKey($periodKey)
+                    ->first();
+
+                if ($existingGrade?->isTeacherLocked()) {
+                    continue;
+                }
+
+                if ($gradeValue !== null && $gradeValue !== '') {
+                    $numericGrade = (float) $gradeValue;
+                } else {
+                    $numericGrade = null;
+                }
+
+                StudentSubjectGrade::query()->updateOrCreate(
+                    [
+                        'student_subject_ID' => $studentSubject->student_subject_ID,
+                        'assignment_ID' => $assignment->assignment_ID,
+                        'term_ID' => StudentSubjectGrade::termIdForPeriodKey($periodKey),
+                    ],
+                    [
+                        'numeric_grade' => $numericGrade,
+                        'remarks' => $remarksValue ?: null,
+                        'status' => 'draft',
+                        'submitted_at' => null,
+                        'reviewed_by' => null,
+                        'reviewed_at' => null,
+                        'grade_return_reason_ID' => null,
+                        'posted_by' => $request->user()->staff_id,
+                    ]
+                );
+            }
+        }
+
+        if (! $request->boolean('submit')) {
+            return back()->with('status', 'Grades saved successfully.');
+        }
+
+        $submitted = $this->submitSavedGrades($assignment, $enrollmentIds, array_keys($editablePeriodKeys));
+
+        if (! $submitted) {
+            return back()->withErrors(['grades' => 'No grades available to submit.'])->withInput();
+        }
+
+        return back()->with('status', 'Grades saved and submitted successfully.');
+    }
+
+    public function advisoryClassListImportStatus(Request $request, Section $section, int $import): \Illuminate\Http\JsonResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        return app(\App\Support\SectionStudentImport::class)->advisoryClassListImportStatus($request, $section, $import);
+    }
+
+    public function importAdvisoryClassList(Request $request, Section $section): RedirectResponse
+    {
+        $this->authorizeAdvisorySection($request, $section);
+
+        return app(\App\Support\SectionStudentImport::class)->importAdvisoryClassList($request, $section);
+    }
+
+    public function importAdvisoryClassListRecords(array $records, Section $section, int $activatedBy, ?callable $progress = null): array
+    {
+        return $this->importRecordsIntoSection($records, $section, $activatedBy, $progress);
+    }
+
+    public function advisoryClassListRecords(array $rows): array
+    {
+        return $this->classListRecords($rows);
+    }
+
+    private function importRecordsIntoSection(array $records, Section $section, int $activatedBy, ?callable $progress = null): array
+    {
+        $enrollmentYear = (int) ($section->academicYear?->start_date?->year ?? now()->year);
+        $createdStudents = 0;
+        $updatedStudents = 0;
+        $createdEnrollments = 0;
+        $existingEnrollments = 0;
+        $failedEnrollments = false;
+        $skippedStudents = 0;
+        $processed = 0;
+        $activeEnrollmentCount = Enrollment::query()
+            ->where('section_ID', $section->section_ID)
+            ->whereIn('enrollment_status_ID', EnrollmentStatus::activeIds())
+            ->count();
+
+        foreach ($records as $record) {
+            // Commit each learner before publishing progress so other requests can see it.
+            DB::transaction(function () use ($record, $section, $activatedBy, $enrollmentYear, &$createdStudents, &$updatedStudents, &$createdEnrollments, &$existingEnrollments, &$failedEnrollments, &$skippedStudents, &$activeEnrollmentCount): void {
+                $student = Student::query()->where('lrn', $record['lrn'])->first();
+                $defaultPassword = StudentCredentials::defaultPassword($record['first_name'], $record['last_name'], $enrollmentYear);
+
+                if (! $student) {
+                    // Email is intentionally not imported. Many SF-1 lists have no
+                    // email, and a shared guardian email must never block accounts.
+                    $student = Student::query()->create([
+                        'username' => StudentCredentials::usernameFromLrn($record['lrn']),
+                        'password' => Hash::make($defaultPassword),
+                        'change_password' => true,
+                        'password_changed_at' => null,
+                        'lrn' => $record['lrn'],
+                        'first_name' => $record['first_name'],
+                        'middle_name' => $record['middle_name'],
+                        'last_name' => $record['last_name'],
+                        'suffix' => $record['suffix'],
+                        'sex' => $record['sex'],
+                        'birthdate' => $record['birthdate'],
+                        'mother_tongue' => $record['mother_tongue'],
+                        'status' => 'approved',
+                        'activated_by' => $activatedBy,
+                        'activated_at' => now(),
+                    ]);
+                    $createdStudents++;
+                } else {
+                    $updates = $this->missingStudentUpdates($student, $record);
+                    if ($student->username === null && ! Student::query()->where('username', StudentCredentials::usernameFromLrn($record['lrn']))->whereKeyNot($student->id)->exists()) {
+                        $updates['username'] = StudentCredentials::usernameFromLrn($record['lrn']);
+                    }
+                    if ($student->password === null) {
+                        $updates['password'] = Hash::make($defaultPassword);
+                        $updates['change_password'] = true;
+                        $updates['password_changed_at'] = null;
+                    }
+                    if (! in_array($student->status, ['approved', 'active'], true)) {
+                        $updates['status'] = 'approved';
+                    }
+                    if ($updates !== []) {
+                        $student->update($updates);
+                        $updatedStudents++;
+                    }
+                }
+
+                $this->importStudentSf1Details($student, $record);
+
+                $conflictingEnrollment = Enrollment::query()
+                    ->where('student_ID', $student->id)
+                    ->where('SY_ID', $section->SY_ID)
+                    ->where('section_ID', '!=', $section->section_ID)
+                    ->first();
+                if ($conflictingEnrollment) {
+                    $failedEnrollments = true;
+                    $skippedStudents++;
+
+                    return;
+                }
+
+                $existingEnrollment = Enrollment::query()
+                    ->where('student_ID', $student->id)
+                    ->where('section_ID', $section->section_ID)
+                    ->where('SY_ID', $section->SY_ID)
+                    ->first();
+
+                if (! $existingEnrollment && (int) $section->capacity > 0 && $activeEnrollmentCount >= (int) $section->capacity) {
+                    $failedEnrollments = true;
+                    $skippedStudents++;
+
+                    return;
+                }
+
+                $enrollment = Enrollment::query()->firstOrCreate(
+                    [
+                        'student_ID' => $student->id,
+                        'section_ID' => $section->section_ID,
+                        'SY_ID' => $section->SY_ID,
+                    ],
+                    [
+                        'curriculum_grade_level_ID' => $section->curriculum_grade_level_ID,
+                        'track_ID' => $section->cluster?->track_ID,
+                        'learner_type' => 'regular',
+                        'enrollment_status' => EnrollmentStatus::ENROLLED,
+                    ],
+                );
+                if ($enrollment->wasRecentlyCreated) {
+                    $createdEnrollments++;
+                    $activeEnrollmentCount++;
+                } else {
+                    $existingEnrollments++;
+                }
+            });
+            $processed++;
+            $result = compact('createdStudents', 'updatedStudents', 'createdEnrollments', 'existingEnrollments', 'failedEnrollments', 'skippedStudents');
+            if ($progress) {
+                $progress($processed, $result);
+            }
+        }
+
+        return compact('createdStudents', 'updatedStudents', 'createdEnrollments', 'existingEnrollments', 'failedEnrollments', 'skippedStudents');
+    }
+
+    public function submitGrades(Request $request, TeacherSubjectAssignment $assignment)
+    {
+        $this->authorizeAssignment($request, $assignment);
+
+        $assignment->load('section.gradeLevel', 'section.curriculum.gradingSemester');
+        $section = $assignment->section;
+        $semester = $assignment->section?->curriculum?->gradingSemester?->key;
+        $enrollmentIds = Enrollment::query()
+            ->where('section_ID', $section->section_ID)
+            ->whereHas('studentSubjects', fn ($query) => $query->where('subject_ID', $assignment->subject_ID))
+            ->pluck('enrollment_ID')
+            ->toArray();
+
+        $editablePeriodKeys = array_column($this->assignmentGradingInputPeriods($assignment), 'key');
+
+        if ($editablePeriodKeys === []) {
+            return back()->withErrors(['grades' => 'No grading term is currently open for submission.']);
+        }
+
+        $updated = $this->submitSavedGrades($assignment, $enrollmentIds, $editablePeriodKeys);
+
+        if (! $updated) {
+            return back()->withErrors(['grades' => 'No grades available to submit.'])->withInput();
+        }
+
+        return back()->with('status', 'Grades submitted successfully.');
+    }
+
+    /**
+     * @param  list<int>  $enrollmentIds
+     * @param  list<string>  $periodKeys
+     */
+    private function submitSavedGrades(TeacherSubjectAssignment $assignment, array $enrollmentIds, array $periodKeys): int
+    {
+        return DB::transaction(function () use ($assignment, $enrollmentIds, $periodKeys): int {
+            $grades = StudentSubjectGrade::query()
+                ->where('assignment_ID', $assignment->assignment_ID)
+                ->whereHas('studentSubject', fn ($query) => $query->whereIn('enrollment_ID', $enrollmentIds))
+                ->whereIn('term_ID', array_map(StudentSubjectGrade::termIdForPeriodKey(...), $periodKeys))
+                ->whereStatus(GradeStatus::teacherEditableSlugs())
+                ->where(function ($query): void {
+                    $query->whereNotNull('numeric_grade')
+                        ->orWhereNotNull('remarks');
+                })
+                ->orderBy('grade_ID')->lockForUpdate()->get(['grade_ID', 'term_ID']);
+
+            if ($grades->isEmpty()) {
+                return 0;
+            }
+
+            $updated = StudentSubjectGrade::query()->whereKey($grades->pluck('grade_ID'))->update([
+                'grade_status_ID' => GradeStatus::idFor(GradeStatus::SUBMITTED),
+                'submitted_at' => now(),
+                'reviewed_by' => null,
+                'reviewed_at' => null,
+                'grade_return_reason_ID' => null,
+            ]);
+
+            RegistrarGradeDigest::record($assignment->assignment_ID, $grades->pluck('term_ID')->unique()->sort());
+
+            return $updated;
+        });
+    }
+
+    public function summaryPrint(Request $request, TeacherSubjectAssignment $assignment): View
+    {
+        $this->authorizeAssignment($request, $assignment);
+
+        $assignment->load(['section.gradeLevel', 'section.curriculum.gradingSemester', 'subject']);
+        $section = $assignment->section;
+        $semester = $section->curriculum?->gradingSemester?->key;
+        $enrollments = Enrollment::query()
+            ->with(['student'])
+            ->where('section_ID', $section->section_ID)
+            ->whereHas('studentSubjects', fn ($query) => $query->where('subject_ID', $assignment->subject_ID))
+            ->orderBy('enrollment_status_ID')
+            ->get()
+            ->sortBy(fn (Enrollment $enrollment) => $this->studentSortKey($enrollment))
+            ->values();
+
+        $periods = GradingTerm::isSeniorHighSection($section)
+            ? GradingTerm::seniorHighPeriods($semester)
+            : GradingTerm::configuredPeriods();
+        $grades = StudentSubjectGrade::query()
+            ->with(['studentSubject', 'term'])
+            ->where('assignment_ID', $assignment->assignment_ID)
+            ->whereHas('studentSubject', fn ($query) => $query->whereIn('enrollment_ID', $enrollments->pluck('enrollment_ID')))
+            ->get()
+            ->groupBy(fn (StudentSubjectGrade $grade) => $grade->studentSubject?->enrollment_ID)
+            ->map(fn ($items) => $items->keyBy('grading_period'));
+
+        // Retain saved results even when a term was subsequently archived or removed from the configured count.
+        $knownKeys = array_column($periods, 'key');
+        foreach ($grades as $gradeSet) {
+            foreach ($gradeSet as $key => $grade) {
+                if (! in_array($key, $knownKeys, true)) {
+                    $periods[] = ['key' => $key, 'label' => $grade->term?->label ?? Str::headline($key)];
+                    $knownKeys[] = $key;
+                }
+            }
+        }
+
+        $termOrder = GradingTerm::query()->whereIn('key', $knownKeys)->pluck('sort_order', 'key');
+        $periods = collect($periods)->sortBy(fn (array $period) => $termOrder->get($period['key'], PHP_INT_MAX))->values()->all();
+
+        $summaries = $this->buildSummaries($enrollments, $grades, $periods);
+
+        return view('users.teacher.sections.summary-print', [
+            'assignment' => $assignment,
+            'section' => $section,
+            'periods' => $periods,
+            'summaries' => $summaries,
+        ]);
+    }
+
+    private function periodsForSection(Section $section): array
+    {
+        return GradingTerm::periodsForSection($section);
+    }
+
+    /**
+     * @return array<int, array{key: string, label: string}>
+     */
+    /** Include registrar exceptions only for this assignment, without opening school-wide input. */
+    private function assignmentGradingInputPeriods(TeacherSubjectAssignment $assignment): array
+    {
+        if (\App\Support\MapehGrades::inputBlocked($assignment)) {
+            return [];
+        }
+        $section = $assignment->section;
+        $semester = $assignment->section?->curriculum?->gradingSemester?->key;
+        $keys = AssignmentGradeTermUnlocker::unlockedPeriodKeysFor($assignment->assignment_ID);
+        if ($this->isGradingInputOpen($section, $semester)) {
+            $keys = array_merge($keys, array_column($this->gradingInputPeriods($section, $semester), 'key'));
+        }
+
+        return array_values(array_filter(
+            GradingTerm::openPeriodsForSection($section, $semester),
+            fn (array $period): bool => in_array($period['key'], $keys, true),
+        ));
+    }
+
+    private function gradingInputPeriods(?Section $section = null, ?string $semester = null): array
+    {
+        $editableKey = GradingTerm::currentEditablePeriodKeyForSection($section, $semester);
+
+        if ($editableKey === null) {
+            return [];
+        }
+
+        return array_values(array_filter(
+            GradingTerm::openPeriodsForSection($section, $semester),
+            fn (array $period): bool => $period['key'] === $editableKey,
+        ));
+    }
+
+    private function isGradingInputOpen(?Section $section, ?string $semester = null): bool
+    {
+        if (! GradingTerm::isSeniorHighSection($section)) {
+            return GradingTerm::isCurrentJuniorHighPeriodOpen();
+        }
+
+        $period = GradingTerm::currentSeniorHighPeriod();
+
+        return (! $semester || $period['semester'] === $semester) && GradingTerm::isCurrentSeniorHighPeriodOpen();
+    }
+
+    private function buildSummaries($enrollments, $grades, array $periods): array
+    {
+        $periodKeys = array_column($periods, 'key');
+        $summaries = [];
+
+        foreach ($enrollments as $enrollment) {
+            $student = $enrollment->student;
+            $application = $student?->application;
+            $name = $application
+                ? $application->last_name.', '.$application->first_name
+                : ($student?->user?->name ?? 'N/A');
+            $gradeSet = $grades[$enrollment->enrollment_ID] ?? collect();
+            $values = [];
+
+            foreach ($periodKeys as $key) {
+                $value = $gradeSet->get($key)?->numeric_grade;
+                if ($value !== null) {
+                    $values[] = (float) $value;
+                }
+            }
+
+            $average = count($values) ? round(array_sum($values) / count($values), 2) : null;
+
+            $summaries[$enrollment->enrollment_ID] = [
+                'average' => $average,
+                'grades' => $gradeSet,
+                'name' => $name,
+            ];
+        }
+
+        return $summaries;
+    }
+
+    private function studentSortKey(Enrollment $enrollment): string
+    {
+        $student = $enrollment->student;
+        $application = $student?->application;
+        $sexRank = match (strtolower((string) $student?->sex)) {
+            'male' => 0,
+            'female' => 1,
+            default => 2,
+        };
+
+        return sprintf(
+            '%d-%s-%s-%s',
+            $sexRank,
+            strtolower((string) ($application?->last_name ?? '')),
+            strtolower((string) ($application?->first_name ?? '')),
+            strtolower((string) ($student?->lrn ?? ''))
+        );
+    }
+
+    private function authorizeAssignment(Request $request, TeacherSubjectAssignment $assignment): void
+    {
+        $staffId = $request->user()?->staff_id;
+
+        if (! $staffId || $assignment->staff_ID !== $staffId) {
+            abort(403);
+        }
+    }
+
+    private function authorizeAdvisorySection(Request $request, Section $section): void
+    {
+        $staffId = $request->user()?->staff_id;
+
+        if (! $staffId || $section->staff_ID !== $staffId) {
+            abort(403);
+        }
+    }
+
+    private function classListRecords(array $rows): array
+    {
+        [$headerIndex, $headerMap] = $this->classListHeader($rows);
+        $records = [];
+
+        foreach (array_slice($rows, $headerIndex + 1) as $row) {
+            $record = $this->classListRecord($row, $headerMap);
+            if ($record) {
+                $records[$record['lrn']] = $record;
+            }
+        }
+
+        return array_values($records);
+    }
+
+    private function classListHeader(array $rows): array
+    {
+        foreach (array_slice($rows, 0, 15, true) as $index => $row) {
+            $map = [];
+            foreach ($row as $column => $heading) {
+                $key = $this->classListHeadingKey($heading);
+                if ($key) {
+                    $map[$key] = $column;
+                }
+            }
+
+            if (isset($map['lrn']) && (isset($map['full_name']) || isset($map['first_name']) || isset($map['last_name']))) {
+                return [$index, $map];
+            }
+        }
+
+        throw new \RuntimeException('Could not find the class list header. Required columns: LRN and learner name.');
+    }
+
+    private function classListRecord(array $row, array $map): ?array
+    {
+        $lrn = $this->lrnValue($this->mappedValue($row, $map, 'lrn'));
+        if (strlen($lrn) !== 12) {
+            return null;
+        }
+
+        $name = $this->nameParts($row, $map);
+        if ($name['first_name'] === '' || $name['last_name'] === '') {
+            return null;
+        }
+
+        return [
+            'lrn' => $lrn,
+            'first_name' => $name['first_name'],
+            'middle_name' => $name['middle_name'] !== '' ? $name['middle_name'] : null,
+            'last_name' => $name['last_name'],
+            'suffix' => $name['suffix'] !== '' ? $name['suffix'] : null,
+            'sex' => $this->sexValue($this->mappedValue($row, $map, 'sex')),
+            'birthdate' => $this->dateValue($this->mappedValue($row, $map, 'birthdate')),
+            'mother_tongue' => $this->nullableText($this->mappedValue($row, $map, 'mother_tongue')),
+            'guardians' => [
+                'father' => $this->personNameParts($this->mappedValue($row, $map, 'father_name')),
+                'mother' => $this->personNameParts($this->mappedValue($row, $map, 'mother_name')),
+                'guardian' => $this->personNameParts($this->mappedValue($row, $map, 'guardian_name')),
+            ],
+            'guardian_contact_no' => $this->nullableText($this->mappedValue($row, $map, 'guardian_contact_no')),
+        ];
+    }
+
+    private function lrnValue(string $value): string
+    {
+        $value = trim($value);
+
+        // Excel commonly renders 12-digit LRNs as values such as
+        // 1.11111111111E11. Convert the numeric value before stripping
+        // formatting characters so the exponent is not mistaken for digits.
+        if (preg_match('/^\d+(?:\.\d+)?[eE][+-]?\d+$/', $value) && is_numeric($value)) {
+            $value = sprintf('%.0f', (float) $value);
+        }
+
+        return preg_replace('/\D/', '', $value) ?? '';
+    }
+
+    private function classListHeadingKey(string $heading): ?string
+    {
+        $normalized = Str::of($heading)->lower()->replaceMatches('/[^a-z0-9]+/', ' ')->squish()->value();
+
+        return match (true) {
+            str_contains($normalized, 'lrn') || str_contains($normalized, 'learner reference') => 'lrn',
+            // DepEd SF-1 uses "NAME (Last Name, First Name, Middle Name)"
+            // as one learner-name column, not three separate columns.
+            str_starts_with($normalized, 'name')
+                && str_contains($normalized, 'last name')
+                && str_contains($normalized, 'first name') => 'full_name',
+            str_contains($normalized, 'first name') || str_contains($normalized, 'given name') => 'first_name',
+            str_contains($normalized, 'middle name') => 'middle_name',
+            str_contains($normalized, 'last name') || str_contains($normalized, 'surname') => 'last_name',
+            str_contains($normalized, 'extension') || str_contains($normalized, 'suffix') => 'suffix',
+            str_starts_with($normalized, 'sex') || str_contains($normalized, 'gender') => 'sex',
+            str_contains($normalized, 'birthdate') || str_contains($normalized, 'birth date') || str_contains($normalized, 'date of birth') => 'birthdate',
+            str_contains($normalized, 'mother tongue') => 'mother_tongue',
+            str_contains($normalized, 'ethnic group') || str_contains($normalized, 'indigenous cultural community') => 'ip_community',
+            str_contains($normalized, 'house') || str_contains($normalized, 'street') || str_contains($normalized, 'sitio') || str_contains($normalized, 'purok') => 'house_no',
+            str_contains($normalized, 'barangay') => 'barangay',
+            str_contains($normalized, 'municipality') || str_contains($normalized, 'city') => 'municipality',
+            str_contains($normalized, 'province') => 'province',
+            str_contains($normalized, 'father') && str_contains($normalized, 'name') => 'father_name',
+            (str_contains($normalized, 'mother') && str_contains($normalized, 'maiden')) => 'mother_name',
+            str_contains($normalized, 'guardian') && str_contains($normalized, 'name') => 'guardian_name',
+            str_contains($normalized, 'contact') || str_contains($normalized, 'mobile') || str_contains($normalized, 'telephone') => 'guardian_contact_no',
+            (str_contains($normalized, 'learner') && str_contains($normalized, 'name'))
+                || $normalized === 'name'
+                || str_contains($normalized, 'name of learner') => 'full_name',
+            default => null,
+        };
+    }
+
+    private function nameParts(array $row, array $map): array
+    {
+        $firstName = $this->mappedValue($row, $map, 'first_name');
+        $middleName = $this->mappedValue($row, $map, 'middle_name');
+        $lastName = $this->mappedValue($row, $map, 'last_name');
+        $suffix = $this->mappedValue($row, $map, 'suffix');
+
+        if (($firstName === '' || $lastName === '') && isset($map['full_name'])) {
+            $fullName = $this->mappedValue($row, $map, 'full_name');
+            if (str_contains($fullName, ',')) {
+                [$lastName, $rest] = array_pad(array_map('trim', explode(',', $fullName, 2)), 2, '');
+                $parts = preg_split('/\s+/', $rest, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+                $firstName = array_shift($parts) ?? '';
+                $middleName = implode(' ', $parts);
+            } else {
+                $parts = preg_split('/\s+/', $fullName, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+                $lastName = array_pop($parts) ?? '';
+                $firstName = array_shift($parts) ?? '';
+                $middleName = implode(' ', $parts);
+            }
+        }
+
+        return [
+            'first_name' => Str::title($firstName),
+            'middle_name' => Str::title($middleName),
+            'last_name' => Str::title($lastName),
+            'suffix' => Str::upper($suffix),
+        ];
+    }
+
+    private function mappedValue(array $row, array $map, string $key): string
+    {
+        if (! isset($map[$key])) {
+            return '';
+        }
+
+        return trim((string) ($row[$map[$key]] ?? ''));
+    }
+
+    private function sexValue(string $value): ?string
+    {
+        $normalized = Str::lower(trim($value));
+
+        return match (true) {
+            in_array($normalized, ['m', 'male'], true) => 'male',
+            in_array($normalized, ['f', 'female'], true) => 'female',
+            default => null,
+        };
+    }
+
+    private function dateValue(string $value): ?string
+    {
+        if ($value === '') {
+            return null;
+        }
+
+        if (is_numeric($value)) {
+            $days = (int) $value;
+            if ($days > 20000) {
+                return now()->setDate(1899, 12, 30)->addDays($days)->toDateString();
+            }
+        }
+
+        try {
+            return \Carbon\Carbon::parse($value)->toDateString();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    private function nullableText(string $value): ?string
+    {
+        $value = trim($value);
+
+        return $value === '' ? null : Str::title($value);
+    }
+
+    /** @return array{first_name: ?string, middle_name: ?string, last_name: ?string, suffix: ?string} */
+    private function personNameParts(string $value): array
+    {
+        $value = trim($value);
+        if ($value === '') {
+            return ['first_name' => null, 'middle_name' => null, 'last_name' => null, 'suffix' => null];
+        }
+
+        $parts = array_map('trim', explode(',', $value));
+        if (count($parts) >= 2) {
+            $lastName = array_shift($parts);
+            $firstName = array_shift($parts) ?? '';
+            $middleName = implode(' ', $parts);
+        } else {
+            $words = preg_split('/\s+/', $value, -1, PREG_SPLIT_NO_EMPTY) ?: [];
+            $lastName = array_pop($words) ?? '';
+            $firstName = array_shift($words) ?? '';
+            $middleName = implode(' ', $words);
+        }
+
+        return [
+            'first_name' => $firstName !== '' ? Str::title($firstName) : null,
+            'middle_name' => $middleName !== '' ? Str::title($middleName) : null,
+            'last_name' => $lastName !== '' ? Str::title($lastName) : null,
+            'suffix' => null,
+        ];
+    }
+
+    private function importStudentSf1Details(Student $student, array $record): void
+    {
+        foreach ($record['guardians'] as $relationship => $attributes) {
+            if (! filled($attributes['first_name']) || ! filled($attributes['last_name'])) {
+                continue;
+            }
+
+            $guardian = StudentGuardian::query()->firstOrNew([
+                'student_ID' => $student->id,
+                'relationship' => $relationship,
+            ]);
+            foreach ($attributes as $field => $value) {
+                if (filled($value) && ! filled($guardian->{$field})) {
+                    $guardian->{$field} = $value;
+                }
+            }
+            if ($relationship === 'guardian' && filled($record['guardian_contact_no']) && ! filled($guardian->contact_no)) {
+                $guardian->contact_no = $record['guardian_contact_no'];
+            }
+            $guardian->save();
+        }
+    }
+
+    private function missingStudentUpdates(Student $student, array $record): array
+    {
+        $updates = [];
+        foreach (['first_name', 'middle_name', 'last_name', 'suffix', 'sex', 'birthdate', 'mother_tongue'] as $field) {
+            if (($student->{$field} === null || $student->{$field} === '') && ! empty($record[$field])) {
+                $updates[$field] = $record[$field];
+            }
+        }
+
+        return $updates;
+    }
+}

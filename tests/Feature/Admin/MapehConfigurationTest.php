@@ -1,0 +1,371 @@
+<?php
+
+use App\Models\AcademicYear;
+use App\Models\Curricula;
+use App\Models\Curriculum;
+use App\Models\CurriculumSubject;
+use App\Models\DataStatus;
+use App\Models\Enrollment;
+use App\Models\EnrollmentMonthlyAttendance;
+use App\Models\GradeLevel;
+use App\Models\GradingSemester;
+use App\Models\GradingTerm;
+use App\Models\MapehConfiguration;
+use App\Models\Role;
+use App\Models\Section;
+use App\Models\Staff;
+use App\Models\Student;
+use App\Models\StudentObservedValue;
+use App\Models\StudentSubject;
+use App\Models\StudentSubjectGrade;
+use App\Models\Subject;
+use App\Models\TeacherSubjectAssignment;
+use App\Support\MapehGrades;
+use App\Support\MapehSetup;
+use App\Support\Sf9ReportCardBuilder;
+
+function mapehFixtures(string $role = 'admin'): array
+{
+    $manager = Staff::create(['role_id' => Role::firstOrCreate(['role_name' => $role])->id, 'username' => 'mapeh.manager', 'password' => 'password', 'first_name' => 'Mapeh', 'last_name' => 'Manager', 'status' => 'active']);
+    $teacher = Staff::create(['role_id' => Role::firstOrCreate(['role_name' => 'teacher'])->id, 'username' => 'mapeh.teacher', 'password' => 'password', 'first_name' => 'Music', 'last_name' => 'Teacher', 'status' => 'active']);
+    $year = AcademicYear::create(['school_year' => '2025-2026', 'start_date' => '2025-06-01', 'end_date' => '2026-03-31', 'status' => true]);
+    $curriculum = Curriculum::create(['name' => 'Grade 7 MAPEH Test', 'curricula_ID' => Curricula::first()->curricula_ID, 'grade_ID' => GradeLevel::idForValue('grade_7'), 'semester_ID' => GradingSemester::idFor(GradingSemester::FULL_YEAR), 'data_status_ID' => DataStatus::where('key', 'active')->value('data_status_ID')]);
+    $subject = Subject::create(['code' => 'MAPEH7', 'title' => 'MAPEH 7', 'school_level' => 'Junior High School', 'type' => 'core', 'status' => 'active']);
+    $parent = CurriculumSubject::create(['curriculum_grade_level_ID' => $curriculum->curriculum_ID, 'subject_ID' => $subject->subject_ID]);
+    $section = Section::create(['name' => '7-A', 'grade_ID' => $curriculum->grade_ID, 'curriculum_grade_level_ID' => $curriculum->curriculum_ID, 'SY_ID' => $year->SY_ID, 'staff_ID' => $teacher->staff_id, 'capacity' => 50]);
+    $student = Student::create(['lrn' => '123456789012', 'first_name' => 'Ana', 'last_name' => 'Santos', 'sex' => 'female', 'status' => 'active']);
+    $enrollment = Enrollment::create(['student_ID' => $student->id, 'section_ID' => $section->section_ID, 'SY_ID' => $year->SY_ID, 'enrollment_status' => 'enrolled', 'learner_type' => 'regular']);
+    $assignment = TeacherSubjectAssignment::create(['section_ID' => $section->section_ID, 'subject_ID' => $parent->subject_ID, 'staff_ID' => $teacher->staff_id, 'SY_ID' => $year->SY_ID]);
+    $data = ['SY_ID' => $year->SY_ID, 'parent_curr_subj_ID' => $parent->curr_subj_ID, 'mode' => 'four'];
+
+    return compact('manager', 'teacher', 'year', 'curriculum', 'parent', 'section', 'student', 'enrollment', 'assignment', 'data');
+}
+
+function mapehComponentGrades(array $f, array $values, string $status = 'approved', string $term = 'term_1'): void
+{
+    $config = MapehConfiguration::where('SY_ID', $f['year']->SY_ID)->firstOrFail();
+    foreach ($config->components as $index => $component) {
+        if (! array_key_exists($index, $values)) {
+            continue;
+        }
+        $subjectId = $component->curriculumSubject->subject_ID;
+        $assignment = TeacherSubjectAssignment::firstOrCreate(['section_ID' => $f['section']->section_ID, 'subject_ID' => $subjectId], ['staff_ID' => $f['teacher']->staff_id, 'SY_ID' => $f['year']->SY_ID]);
+        $roster = StudentSubject::where('enrollment_ID', $f['enrollment']->enrollment_ID)->where('subject_ID', $subjectId)->firstOrFail();
+        StudentSubjectGrade::updateOrCreate(['student_subject_ID' => $roster->student_subject_ID, 'assignment_ID' => $assignment->assignment_ID, 'term_ID' => StudentSubjectGrade::termIdForPeriodKey($term)], ['numeric_grade' => $values[$index], 'status' => $status, 'posted_by' => $f['teacher']->staff_id]);
+    }
+}
+
+function mapehDisplay(array $f, bool $releasedOnly = false): array
+{
+    $assignments = TeacherSubjectAssignment::with('subject')->where('section_ID', $f['section']->section_ID)->get();
+    $grades = StudentSubjectGrade::get()->groupBy('assignment_ID')->map(fn ($items) => $items->keyBy('grading_period'));
+    $display = MapehGrades::assignments($f['section']->fresh(), $assignments);
+
+    return [$display, MapehGrades::grades($display, $grades, ['term_1'], $releasedOnly)];
+}
+
+test('promotion accepts complete released MAPEH components without a manually entered parent grade', function (string $mode) {
+    $f = mapehFixtures();
+    MapehSetup::save($f['curriculum'], array_replace($f['data'], ['mode' => $mode]));
+    foreach (GradingTerm::configuredPeriods() as $period) {
+        mapehComponentGrades($f, $mode === 'paired' ? [88, 92] : [88, 90, 86, 92], 'released', $period['key']);
+    }
+    GradingTerm::closeAllJuniorHighTerms();
+    foreach (GradingTerm::configuredPeriods() as $period) {
+        foreach (Sf9ReportCardBuilder::observedValueStatements() as $statement) {
+            StudentObservedValue::create([
+                'enrollment_ID' => $f['enrollment']->enrollment_ID,
+                'statement_key' => $statement['key'],
+                'grading_period' => $period['key'],
+                'marking' => 'AO',
+                'status' => 'recorded',
+                'posted_by' => $f['teacher']->staff_id,
+            ]);
+        }
+    }
+    foreach (array_keys($f['year']->attendanceMonths()) as $month) {
+        EnrollmentMonthlyAttendance::create([
+            'enrollment_ID' => $f['enrollment']->enrollment_ID,
+            'month' => $month,
+            'days_present' => 20,
+            'days_absent' => 0,
+        ]);
+    }
+
+    $evaluation = \App\Support\PromotionEligibility::evaluate($f['enrollment']->fresh());
+    expect($evaluation['status'])->toBe('eligible')
+        ->and($evaluation['subject_averages'])->toHaveCount(1);
+    $batch = \App\Support\PromotionEligibility::synchronizeMany(Enrollment::whereKey($f['enrollment']->getKey())->get());
+    expect($batch[$f['enrollment']->getKey()])->toBe($evaluation);
+    $this->actingAs($f['teacher'])->get(route('teacher.advisory.promotions.index', $f['section']))
+        ->assertOk()->assertSee('General Average')->assertSee('Eligible for Promotion')
+        ->assertSee($mode === 'paired' ? '>90</td>' : '>89</td>', false);
+
+    StudentSubjectGrade::firstOrFail()->update(['status' => 'draft']);
+    expect(\App\Support\PromotionEligibility::evaluate($f['enrollment']->fresh())['status'])->toBe('pending');
+    $batch = \App\Support\PromotionEligibility::synchronizeMany(Enrollment::whereKey($f['enrollment']->getKey())->get());
+    expect($batch[$f['enrollment']->getKey()]['status'])->toBe('pending');
+})->with(['four', 'paired']);
+
+test('admin and principal configure MAPEH components with roster backfill', function (string $role, string $mode, int $count) {
+    $f = mapehFixtures($role);
+    $this->actingAs($f['manager'])->get(route($role.'.curriculum-config.mapeh.edit', $f['curriculum']))->assertOk()->assertSee('Save MAPEH Configuration');
+    $this->post(route($role.'.curriculum-config.mapeh.store', $f['curriculum']), array_replace($f['data'], ['mode' => $mode]))->assertSessionHasNoErrors()->assertRedirect();
+    $config = MapehConfiguration::sole();
+    expect($config->components)->toHaveCount($count)->and($config->mode)->toBe($mode)
+        ->and(StudentSubject::where('enrollment_ID', $f['enrollment']->enrollment_ID)->count())->toBe($count + 1);
+    $this->get(route($role.'.curriculum-config.mapeh.edit', $f['curriculum']))->assertOk()->assertSee('Component teachers by class')->assertSee('Not assigned');
+    // Reposting the same configuration never duplicates subjects or grades.
+    $this->post(route($role.'.curriculum-config.mapeh.store', $f['curriculum']), array_replace($f['data'], ['mode' => $mode]))->assertSessionHasNoErrors();
+    expect(MapehConfiguration::count())->toBe(1)->and(StudentSubjectGrade::count())->toBe(0);
+})->with([['admin', 'four', 4], ['principal', 'paired', 2]]);
+
+test('principal component configuration toast renders above the top bar stacking context', function () {
+    $f = mapehFixtures('principal');
+
+    $response = $this->actingAs($f['manager'])
+        ->withSession(['status' => 'Subject components configured.'])
+        ->get(route('principal.curriculum-config.mapeh.edit', $f['curriculum']));
+
+    $response->assertOk()->assertSee('id="mapeh-toast"', false);
+    $html = $response->getContent();
+
+    expect(strpos($html, 'id="mapeh-toast"'))
+        ->toBeGreaterThan(strpos($html, '</main>'));
+});
+
+test('existing subjects can be linked without creating duplicate catalog entries', function () {
+    $f = mapehFixtures();
+    $selected = [];
+    foreach (MapehConfiguration::labels('four') as $key => $label) {
+        $selected[$key] = Subject::create(['code' => strtoupper($key), 'title' => $label, 'school_level' => 'Junior High School', 'type' => 'core', 'status' => 'active'])->subject_ID;
+    }
+    $before = Subject::count();
+    MapehSetup::save($f['curriculum'], $f['data'] + ['components' => $selected]);
+    expect(Subject::count())->toBe($before)->and(MapehConfiguration::sole()->components)->toHaveCount(4);
+});
+
+test('MAPEH requires every approved component and counts zero as a real grade', function (array $values, string $status, ?int $expected) {
+    $f = mapehFixtures();
+    MapehSetup::save($f['curriculum'], $f['data']);
+    mapehComponentGrades($f, $values, $status);
+    [$assignments, $grades] = mapehDisplay($f);
+    $parent = $assignments->firstWhere('computed_mapeh', true);
+    expect($grades[$parent->assignment_ID]['term_1']->numeric_grade)->toBe($expected);
+})->with([
+    [[88, 90, 86, 92], 'approved', 89],
+    [[88, 90, 86], 'approved', null],
+    [[88, 90, 86, 92], 'draft', null],
+    [[88, 90, 86, 92], 'submitted', null],
+    [[0, 80, 80, 80], 'approved', 60],
+]);
+
+test('SF9 combines paired components once and shows their correct labels', function () {
+    $f = mapehFixtures();
+    MapehSetup::save($f['curriculum'], array_replace($f['data'], ['mode' => 'paired']));
+    mapehComponentGrades($f, [88, 92]);
+    $assignments = TeacherSubjectAssignment::with('subject')->get();
+    $grades = StudentSubjectGrade::get()->groupBy('assignment_ID')->map(fn ($items) => $items->keyBy('grading_period'));
+    $card = Sf9ReportCardBuilder::buildCard($f['enrollment'], $f['section']->fresh(), $assignments, $grades, collect(), [['key' => 'term_1', 'label' => 'Term 1']]);
+    $rows = collect($card['subjects'])->keyBy('label');
+    expect($rows['MAPEH']['quarters']['term_1'])->toBe(90.0)->and($rows['MAPEH']['final'])->toBe(90.0)
+        ->and($rows['Music & Arts']['quarters']['term_1'])->toBe(88.0)
+        ->and($rows['Physical Education & Health']['quarters']['term_1'])->toBe(92.0)
+        ->and($card['general_average'])->toBe(90);
+});
+
+test('SF9 shows the MAPEH final and general average when only the first term has grades', function () {
+    $f = mapehFixtures();
+    MapehSetup::save($f['curriculum'], array_replace($f['data'], ['mode' => 'paired']));
+    mapehComponentGrades($f, [83, 85]);
+    $assignments = TeacherSubjectAssignment::with('subject')->get();
+    $grades = StudentSubjectGrade::get()->groupBy('assignment_ID')->map(fn ($items) => $items->keyBy('grading_period'));
+    $periods = [
+        ['key' => 'term_1', 'label' => 'Term 1'],
+        ['key' => 'term_2', 'label' => 'Term 2'],
+    ];
+
+    $card = Sf9ReportCardBuilder::buildCard($f['enrollment'], $f['section']->fresh(), $assignments, $grades, collect(), $periods);
+    $rows = collect($card['subjects'])->keyBy('label');
+
+    expect($rows['MAPEH']['quarters']['term_1'])->toBe(84.0)
+        ->and($rows['MAPEH']['quarters']['term_2'])->toBeNull()
+        ->and($rows['MAPEH']['final'])->toBe(84.0)
+        ->and($rows['MAPEH']['remarks'])->toBe('Passed')
+        ->and($card['general_average'])->toBe(84);
+});
+
+test('legacy MAPEH grades are preserved until component entry begins for that term', function () {
+    $f = mapehFixtures();
+    $legacy = StudentSubjectGrade::create(['student_subject_ID' => StudentSubject::sole()->student_subject_ID, 'assignment_ID' => $f['assignment']->assignment_ID, 'term_ID' => StudentSubjectGrade::termIdForPeriodKey('term_1'), 'numeric_grade' => 91, 'status' => 'released', 'posted_by' => $f['teacher']->staff_id]);
+    MapehSetup::save($f['curriculum'], $f['data']);
+    [$assignments, $grades] = mapehDisplay($f, true);
+    expect($grades[$assignments->firstWhere('computed_mapeh', true)->assignment_ID]['term_1']->numeric_grade)->toEqual(91);
+    mapehComponentGrades($f, [88], 'draft');
+    [$assignments, $grades] = mapehDisplay($f, true);
+    expect($grades[$assignments->firstWhere('computed_mapeh', true)->assignment_ID]['term_1']->numeric_grade)->toBeNull()
+        ->and($legacy->fresh()->numeric_grade)->toEqual(91);
+});
+
+test('teachers cannot configure MAPEH or manually overwrite its calculated parent', function () {
+    $f = mapehFixtures();
+    $this->actingAs($f['teacher'])->post(route('admin.curriculum-config.mapeh.store', $f['curriculum']), $f['data'])->assertForbidden();
+    MapehSetup::save($f['curriculum'], $f['data']);
+    $this->post(route('teacher.sections.grades.store', $f['assignment']), ['grades' => [$f['enrollment']->enrollment_ID => ['term_1' => ['grade' => 100]]]])->assertSessionHasErrors('grades');
+    expect(StudentSubjectGrade::count())->toBe(0);
+    $this->actingAs($f['manager'])->post(route('admin.teacher-assignments.store'), ['section_ID' => $f['section']->section_ID, 'curr_subj_ID' => $f['parent']->curr_subj_ID, 'staff_ID' => $f['teacher']->staff_id])->assertSessionHasErrors('curr_subj_ID');
+});
+
+test('configuration is isolated by school year and existing mappings cannot be replaced', function () {
+    $f = mapehFixtures();
+    MapehSetup::save($f['curriculum'], $f['data']);
+    $this->actingAs($f['manager'])->post(route('admin.curriculum-config.mapeh.store', $f['curriculum']), array_replace($f['data'], ['mode' => 'paired']))->assertSessionHasErrors('mode');
+    $year = AcademicYear::create(['school_year' => '2026-2027', 'start_date' => '2026-06-01', 'end_date' => '2027-03-31', 'status' => false]);
+    MapehSetup::save($f['curriculum'], array_replace($f['data'], ['SY_ID' => $year->SY_ID, 'mode' => 'paired']));
+    expect(MapehConfiguration::forSection($f['section']->fresh())->mode)->toBe('four')->and(MapehConfiguration::count())->toBe(2);
+    $section = $f['section']->replicate();
+    $section->SY_ID = $year->SY_ID;
+    $section->save();
+    $enrollment = Enrollment::create(['student_ID' => $f['student']->id, 'section_ID' => $section->section_ID, 'SY_ID' => $year->SY_ID, 'enrollment_status' => 'enrolled', 'learner_type' => 'regular']);
+    expect($enrollment->studentSubjects)->toHaveCount(2);
+});
+
+test('component teachers can import and save their own grades without editing another component', function () {
+    $f = mapehFixtures();
+    $config = MapehSetup::save($f['curriculum'], $f['data']);
+    $componentAssignments = [];
+    foreach ($config->components as $index => $component) {
+        $teacher = $f['teacher']->replicate();
+        $teacher->username = 'component.teacher.'.$index;
+        $teacher->save();
+        $this->actingAs($f['manager'])->post(route('admin.teacher-assignments.store'), ['section_ID' => $f['section']->section_ID, 'curr_subj_ID' => $component->curr_subj_ID, 'staff_ID' => $teacher->staff_id])->assertSessionHasNoErrors();
+        $assignment = TeacherSubjectAssignment::where('subject_ID', $component->curriculumSubject->subject_ID)->sole();
+        $componentAssignments[] = $assignment;
+        $this->actingAs($teacher)->postJson(route('teacher.sections.grades.import', $assignment), [
+            'period' => 'term_1', 'class_record' => \Tests\Support\EClassRecordFixture::upload(),
+        ])->assertOk()->assertJsonPath('grades.0.grade', 87);
+        $this->post(route('teacher.sections.grades.store', $assignment), ['grades' => [$f['enrollment']->enrollment_ID => ['term_1' => ['grade' => 87 + $index]]]])->assertSessionHasNoErrors();
+    }
+    expect(StudentSubjectGrade::count())->toBe(4)->and(StudentSubjectGrade::where('assignment_ID', $f['assignment']->assignment_ID)->count())->toBe(0);
+    $this->post(route('teacher.sections.grades.store', $componentAssignments[0]), ['grades' => [$f['enrollment']->enrollment_ID => ['term_1' => ['grade' => 100]]]])->assertForbidden();
+});
+
+test('paired MAPEH component imports use their own worksheet in a shared workbook', function () {
+    $f = mapehFixtures();
+    $config = MapehSetup::save($f['curriculum'], array_replace($f['data'], ['mode' => 'paired']));
+    $expected = ['music_arts' => 83, 'pe_health' => 85];
+    $workbook = [
+        'TERM 1' => [['Santos, Ana', '70']],
+        'TERM 1 M and A' => [['Santos, Ana', '83']],
+        'TERM 1 PE and H' => [['Santos, Ana', '85']],
+    ];
+
+    foreach ($config->components as $component) {
+        $assignment = TeacherSubjectAssignment::create([
+            'section_ID' => $f['section']->section_ID,
+            'subject_ID' => $component->curriculumSubject->subject_ID,
+            'staff_ID' => $f['teacher']->staff_id,
+            'SY_ID' => $f['year']->SY_ID,
+        ]);
+        $this->actingAs($f['teacher'])->get(route('teacher.sections.show', $assignment))
+            ->assertOk()->assertSee(($component->key === 'music_arts' ? 'M and A' : 'PE and H').' worksheet');
+        $this->actingAs($f['teacher'])->postJson(route('teacher.sections.grades.import', $assignment), [
+            'period' => 'term_1',
+            'class_record' => \Tests\Support\EClassRecordFixture::upload($workbook),
+        ])->assertOk()->assertJsonPath('grades.0.grade', $expected[$component->key]);
+    }
+});
+
+test('paired MAPEH import refuses another component worksheet', function () {
+    $f = mapehFixtures();
+    $config = MapehSetup::save($f['curriculum'], array_replace($f['data'], ['mode' => 'paired']));
+    $music = $config->components->firstWhere('key', 'music_arts');
+    $assignment = TeacherSubjectAssignment::create([
+        'section_ID' => $f['section']->section_ID,
+        'subject_ID' => $music->curriculumSubject->subject_ID,
+        'staff_ID' => $f['teacher']->staff_id,
+        'SY_ID' => $f['year']->SY_ID,
+    ]);
+
+    $this->actingAs($f['teacher'])->postJson(route('teacher.sections.grades.import', $assignment), [
+        'period' => 'term_1',
+        'class_record' => \Tests\Support\EClassRecordFixture::upload(['TERM 1 PE and H' => [['Santos, Ana', '85']]]),
+    ])->assertUnprocessable()->assertJsonValidationErrors('class_record');
+});
+
+test('student grades advisory SF10 and SF5 use the combined MAPEH grade', function () {
+    $this->withoutMiddleware(\App\Http\Middleware\EnsureStudent::class);
+    $f = mapehFixtures();
+    $f['student']->update(['username' => 'mapeh.student', 'password' => 'password', 'change_password' => false]);
+    MapehSetup::save($f['curriculum'], $f['data']);
+    foreach (GradingTerm::configuredPeriods() as $period) {
+        mapehComponentGrades($f, [88, 90, 86, 92], 'released', $period['key']);
+    }
+    $math = Subject::create(['code' => 'MATH', 'title' => 'Mathematics', 'school_level' => 'Junior High School', 'type' => 'core', 'status' => 'active']);
+    $offering = CurriculumSubject::create(['curriculum_grade_level_ID' => $f['curriculum']->curriculum_ID, 'subject_ID' => $math->subject_ID]);
+    $mathAssignment = TeacherSubjectAssignment::create(['section_ID' => $f['section']->section_ID, 'subject_ID' => $offering->subject_ID, 'staff_ID' => $f['teacher']->staff_id, 'SY_ID' => $f['year']->SY_ID]);
+    $roster = StudentSubject::create(['enrollment_ID' => $f['enrollment']->enrollment_ID, 'subject_ID' => $offering->subject_ID]);
+    foreach (GradingTerm::configuredPeriods() as $period) {
+        StudentSubjectGrade::create(['student_subject_ID' => $roster->student_subject_ID, 'assignment_ID' => $mathAssignment->assignment_ID, 'term_ID' => StudentSubjectGrade::termIdForPeriodKey($period['key']), 'numeric_grade' => 75, 'status' => 'released', 'posted_by' => $f['teacher']->staff_id]);
+    }
+    $this->actingAs($f['student'])->get(route('student.grades'))->assertOk()->assertDontSee('MAPEH 7')->assertSee('MAPEH - Music')->assertSee('82');
+    $this->get(route('student.grades', ['session' => $f['enrollment']->enrollment_ID, 'report' => 1]))->assertOk()->assertSee('89')->assertSee('82');
+    $this->actingAs($f['teacher'])->get(route('teacher.advisory.show', $f['section']))->assertOk()->assertDontSee('MAPEH7')->assertSee('82');
+    $assignments = TeacherSubjectAssignment::with('subject')->get();
+    $record = \App\Support\LearnerPermanentRecordBuilder::buildScholasticRecord($f['enrollment'], $f['section']->fresh(), $assignments, StudentSubjectGrade::get(), GradingTerm::configuredPeriods());
+    expect(collect($record['subjects'])->firstWhere('label', 'MAPEH')['final'])->toBe(89.0)
+        ->and($record['general_average'])->toBe(82.0);
+    $sf5 = \App\Support\Sf5ReportBuilder::rows($f['section']->fresh());
+    expect($sf5[0]['average'])->toBe(82)->and($sf5[0]['action'])->toBe('PROMOTED');
+    StudentSubjectGrade::query()->first()->update(['status' => 'approved']);
+    $sf5 = \App\Support\Sf5ReportBuilder::rows($f['section']->fresh());
+    expect($sf5[0]['average'])->toBeNull();
+});
+
+test('MAPEH remains hidden from students until every component is released', function () {
+    $f = mapehFixtures();
+    MapehSetup::save($f['curriculum'], $f['data']);
+    mapehComponentGrades($f, [88, 90, 86, 92], 'approved');
+    [$assignments, $grades] = mapehDisplay($f, true);
+    expect($grades[$assignments->firstWhere('computed_mapeh', true)->assignment_ID]['term_1']->numeric_grade)->toBeNull();
+    mapehComponentGrades($f, [88, 90, 86, 92], 'released');
+    [$assignments, $grades] = mapehDisplay($f, true);
+    expect($grades[$assignments->firstWhere('computed_mapeh', true)->assignment_ID]['term_1']->numeric_grade)->toBe(89);
+});
+
+test('unassigned MAPEH components keep class submission progress incomplete', function () {
+    $f = mapehFixtures();
+    MapehSetup::save($f['curriculum'], $f['data']);
+    $progress = \App\Support\SectionGradeSubmissionProgress::forAssignments(collect([$f['assignment']]), []);
+    expect($progress[$f['section']->section_ID])->toBe(['submitted' => 0, 'expected' => 4]);
+    mapehComponentGrades($f, [88, 90, 86], 'submitted');
+    $assignments = TeacherSubjectAssignment::get();
+    $terms = $assignments->mapWithKeys(fn ($assignment) => [$assignment->assignment_ID => [['term_ID' => StudentSubjectGrade::termIdForPeriodKey('term_1')]]])->all();
+    $progress = \App\Support\SectionGradeSubmissionProgress::forAssignments($assignments, $terms);
+    expect($progress[$f['section']->section_ID])->toBe(['submitted' => 3, 'expected' => 4]);
+});
+
+test('configured parent MAPEH is hidden from assignment and student subject lists without deleting history', function () {
+    $this->withoutMiddleware(\App\Http\Middleware\EnsureStudent::class);
+    $f = mapehFixtures();
+    $f['student']->update(['username' => 'mapeh.student', 'password' => 'password', 'change_password' => false]);
+    MapehSetup::save($f['curriculum'], $f['data']);
+    mapehComponentGrades($f, [88, 90, 86, 92], 'released');
+    $response = $this->actingAs($f['manager'])->get(route('admin.teacher-assignments.index', ['SY_ID' => $f['year']->SY_ID]));
+    $response->assertOk();
+    expect($response->viewData('assignments')->getCollection()->pluck('subject_ID'))->not->toContain($f['parent']->subject_ID)
+        ->and($response->viewData('subjectRows')->getCollection()->pluck('subject.subject_ID'))->not->toContain($f['parent']->subject_ID)
+        ->and($response->viewData('mapehExcludedBySection')[$f['section']->section_ID])->toContain($f['parent']->curr_subj_ID);
+    $this->actingAs($f['teacher'])->get(route('teacher.sections.index'))->assertOk()->assertDontSee('MAPEH 7')->assertSee('MAPEH - Music');
+    $this->get(route('teacher.sections.show', $f['assignment']))->assertRedirect(route('teacher.sections.index'));
+    $this->actingAs($f['student'])->get(route('student.subjects'))->assertOk()->assertDontSee('MAPEH 7')->assertSee('MAPEH - Music');
+    expect(TeacherSubjectAssignment::find($f['assignment']->assignment_ID))->not->toBeNull()
+        ->and(StudentSubject::where('enrollment_ID', $f['enrollment']->enrollment_ID)->where('subject_ID', $f['parent']->subject_ID)->exists())->toBeTrue();
+    $year = AcademicYear::create(['school_year' => '2024-2025', 'start_date' => '2024-06-01', 'end_date' => '2025-03-31', 'status' => false]);
+    $section = $f['section']->replicate();
+    $section->SY_ID = $year->SY_ID;
+    $section->save();
+    $historical = TeacherSubjectAssignment::create(['section_ID' => $section->section_ID, 'subject_ID' => $f['parent']->subject_ID, 'staff_ID' => $f['teacher']->staff_id, 'SY_ID' => $year->SY_ID]);
+    expect(TeacherSubjectAssignment::withoutMapehParents()->whereKey($historical->assignment_ID)->exists())->toBeTrue();
+    $this->actingAs($f['teacher'])->get(route('teacher.sections.index', ['SY_ID' => $year->SY_ID]))->assertOk()->assertSee('MAPEH 7');
+});
